@@ -6,8 +6,28 @@ import psutil
 import os
 import time
 from datetime import datetime, timedelta
+from flask import Flask
+from threading import Thread
 
-# --- 環境変数からトークン取得 (Render対応) ---
+# ==========================================
+# 🌐 Render ポート監視（Health Check）対策
+# ==========================================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Flaskを裏で別スレッド起動
+Thread(target=run_flask).start()
+
+# ==========================================
+# 🤖 Discord Bot 基本設定
+# ==========================================
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = 1301944996261400656
 
@@ -117,7 +137,7 @@ class TypeAddModal(discord.ui.Modal, title="➕ 列車種別を追加"):
             return
         t_name = self.type_name.value.strip()
         stop_list = normalize_input(self.stops.value)
-        self.session_data.train_types[t_name] = stop_list  # スタック追加
+        self.session_data.train_types[t_name] = stop_list  # 追加・更新
         await interaction.response.send_message(f"✅ 種別『{t_name}』を追加しました！", ephemeral=True)
 
 class QuadTrackModal(discord.ui.Modal, title="🛤️ 複々線区間を設定"):
@@ -404,7 +424,6 @@ class AdminPanelView(discord.ui.View):
 # 🤖 コマンド群
 # ==========================================
 
-# 1. ダイヤ作成開始 Slash コマンド
 @bot.tree.command(name="create", description="路線ダイヤの作成を開始します")
 @app_commands.describe(路線名="ダイヤを作成する路線名を入力")
 async def create(interaction: discord.Interaction, 路線名: str):
@@ -436,7 +455,6 @@ async def create(interaction: discord.Interaction, 路線名: str):
     msg = await interaction.original_response()
     user_sessions[msg.id] = TrainData(路線名, interaction.user.id)
 
-# 2. 管理パネルコマンド (!adminpanel)
 @bot.command(name="adminpanel")
 async def adminpanel(ctx):
     if ctx.author.id not in admin_users:
@@ -454,7 +472,6 @@ async def adminpanel(ctx):
 
     await ctx.send(embed=embed, view=AdminPanelView())
 
-# 3. メッセージ遠隔送信コマンド (!sendmessage)
 @bot.command(name="sendmessage")
 async def sendmessage(ctx, channel_id: int, *, content: str):
     if ctx.author.id not in admin_users:
@@ -475,7 +492,6 @@ async def sendmessage(ctx, channel_id: int, *, content: str):
     except Exception as e:
         await ctx.send(f"⚠️ 送信に失敗しました: {e}")
 
-# 4. Botステータス確認コマンド (!botinfo)
 @bot.command(name="botinfo")
 async def botinfo(ctx):
     if ctx.author.id not in admin_users:
@@ -517,7 +533,6 @@ async def botinfo(ctx):
 
     await ctx.send(embed=embed)
 
-# ブラックリストサーバー自動脱出イベント
 @bot.event
 async def on_guild_join(guild):
     if guild.id in blacklisted_servers:
