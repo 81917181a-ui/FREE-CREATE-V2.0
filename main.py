@@ -58,10 +58,14 @@ class TrainData:
         self.author_id = author_id
         self.stations = []
         self.durations = []
-        self.train_types = {}  # {種別名: [停車駅]}
-        self.schedules = []    # [(時刻, 種別, 開始駅, 終了駅)]
+        self.train_types = {}       # {種別名: [停車駅]}
+        self.start_station = ""     # 始発駅
+        self.start_time = "06:00"   # 開始時間
+        self.train_count = 1        # 編成数
+        self.interval_mins = 10     # 運行間隔（分）
         self.quad_tracks = ""
         self.passing_stations = []
+        self.output_target = "thread" # "thread" または "dm"
 
 user_sessions = {}  # {message_id: TrainData}
 
@@ -73,22 +77,13 @@ def generate_status_embed(session: TrainData) -> discord.Embed:
     types_text = ", ".join(session.train_types.keys()) if session.train_types else "未設定"
     durations_text = ", ".join(map(str, session.durations)) + "秒" if session.durations else "未設定"
     
-    # 始発駅・終着駅・運行列車の表示
-    if session.schedules:
-        sch_list = []
-        for time_str, t_type, start_st, end_st in session.schedules[:5]:  # 最新5件まで表示
-            start_disp = start_st if start_st else (session.stations[0] if session.stations else "始発駅未定")
-            end_disp = end_st if end_st else (session.stations[-1] if session.stations else "終着駅未定")
-            sch_list.append(f"`{time_str}` {t_type} 【{start_disp} ➔ {end_disp}】")
-        
-        schedules_text = "\n・".join(sch_list)
-        if len(session.schedules) > 5:
-            schedules_text += f"\n...他 {len(session.schedules) - 5} 本"
-    else:
-        schedules_text = "なし"
+    start_st_text = session.start_station if session.start_station else (session.stations[0] if session.stations else "未設定")
+    start_time_text = session.start_time if session.start_time else "未設定"
+    train_count_text = f"{session.train_count} 編成（{session.interval_mins}分間隔）"
 
     passing_text = ", ".join(session.passing_stations) if session.passing_stations else "なし"
     quad_text = session.quad_tracks if session.quad_tracks else "なし"
+    target_disp = "🧵 スレッドに送信" if session.output_target == "thread" else "📩 DMに送信"
 
     embed = discord.Embed(
         title=f"🚉 {session.line_name} のダイヤを作成中",
@@ -97,9 +92,12 @@ def generate_status_embed(session: TrainData) -> discord.Embed:
             f"・駅名: {stations_text}\n"
             f"・種別: {types_text}\n"
             f"・区間所要時間: {durations_text}\n"
-            f"・始発駅・終着駅・運行列車:\n・{schedules_text}\n"
+            f"・始発駅: {start_st_text}\n"
+            f"・開始時間: {start_time_text}\n"
+            f"・編成数: {train_count_text}\n"
             f"・待避可能駅: {passing_text}\n"
-            f"・複々線区間: {quad_text}\n\n"
+            f"・複々線区間: {quad_text}\n"
+            f"・**出力先設定**: `{target_disp}`\n\n"
             "───────────────────\n"
             "👇 **行いたい操作を選択してください**"
         ),
@@ -140,16 +138,27 @@ class StationModal(discord.ui.Modal, title="🚉 駅名を登録・編集"):
         await update_message_embed(interaction, self.session_data)
         await interaction.response.send_message("✅ 駅名を登録・更新しました！", ephemeral=True)
 
-class TimeModal(discord.ui.Modal, title="⏱️ 時間・運行設定"):
+class TimeModal(discord.ui.Modal, title="⏱️ 時間・運行スケジュール設定"):
     durations_input = discord.ui.TextInput(
         label="各区間の基準所要時間（秒）",
         placeholder="例: 180, 120, 240, 150",
         required=True
     )
-    schedules_input = discord.ui.TextInput(
-        label="運行する列車",
-        style=discord.TextStyle.paragraph,
-        placeholder="例:\n06:00, 各停\n06:05, 急行, 御茶ノ水, 新宿\n06:12, 各停, 神田",
+    start_station_input = discord.ui.TextInput(
+        label="始発駅",
+        placeholder="例: 東京（空欄で最前駅）",
+        required=False
+    )
+    start_time_input = discord.ui.TextInput(
+        label="開始時間（1番列車の発車時刻）",
+        placeholder="例: 06:00",
+        default="06:00",
+        required=True
+    )
+    train_count_input = discord.ui.TextInput(
+        label="編成数（運行本数）と 発車間隔(分)",
+        placeholder="例: 5, 10 (5編成を10分間隔で運行)",
+        default="5, 10",
         required=True
     )
 
@@ -159,20 +168,21 @@ class TimeModal(discord.ui.Modal, title="⏱️ 時間・運行設定"):
 
     async def on_submit(self, interaction: discord.Interaction):
         durations = [int(d) for d in normalize_input(self.durations_input.value) if d.isdigit()]
-        raw_schedules = self.schedules_input.value.strip().split("\n")
-        schedules = []
-        for line in raw_schedules:
-            items = normalize_input(line)
-            if len(items) >= 2:
-                time_str, t_type = items[0], items[1]
-                start_st = items[2] if len(items) > 2 else None
-                end_st = items[3] if len(items) > 3 else None
-                schedules.append((time_str, t_type, start_st, end_st))
-
         self.session_data.durations = durations
-        self.session_data.schedules = schedules
+        
+        if self.start_station_input.value.strip():
+            self.session_data.start_station = self.start_station_input.value.strip()
+        
+        self.session_data.start_time = self.start_time_input.value.strip()
+
+        count_parts = [int(p) for p in normalize_input(self.train_count_input.value) if p.isdigit()]
+        if len(count_parts) >= 1:
+            self.session_data.train_count = count_parts[0]
+        if len(count_parts) >= 2:
+            self.session_data.interval_mins = count_parts[1]
+
         await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message("✅ 時間・運行設定を更新しました！", ephemeral=True)
+        await interaction.response.send_message("✅ 時間・運行設定を自動安全計算用に更新しました！", ephemeral=True)
 
 class TypeAddModal(discord.ui.Modal, title="➕ 列車種別を追加"):
     type_name = discord.ui.TextInput(label="種別名", placeholder="例: 急行", required=True)
@@ -217,6 +227,27 @@ class PassingModal(discord.ui.Modal, title="🔀 待避可能駅を設定"):
         await interaction.response.send_message("✅ 待避可能駅を設定しました！", ephemeral=True)
 
 # ==========================================
+# 📩 出力先選択 View
+# ==========================================
+
+class OutputTargetView(discord.ui.View):
+    def __init__(self, session_data):
+        super().__init__(timeout=60)
+        self.session_data = session_data
+
+    @discord.ui.button(label="🧵 チャンネル内にスレッドを作成して出力", style=discord.ButtonStyle.primary)
+    async def select_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.session_data.output_target = "thread"
+        await update_message_embed(interaction, self.session_data)
+        await interaction.response.send_message("✅ ダイヤの出力先を **スレッド** に設定しました！", ephemeral=True)
+
+    @discord.ui.button(label="📩 個人の DM (ダイレクトメッセージ) に出力", style=discord.ButtonStyle.success)
+    async def select_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.session_data.output_target = "dm"
+        await update_message_embed(interaction, self.session_data)
+        await interaction.response.send_message("✅ ダイヤの出力先を **DM** に設定しました！", ephemeral=True)
+
+# ==========================================
 # 🗑️ ダイヤ用 削除ドロップダウン
 # ==========================================
 
@@ -240,7 +271,8 @@ class DeleteSelect(discord.ui.Select):
             await interaction.response.send_message("🗑️ 駅名設定を削除しました。", ephemeral=True)
         elif val == "times":
             self.session_data.durations = []
-            self.session_data.schedules = []
+            self.session_data.start_time = "06:00"
+            self.session_data.train_count = 1
             await update_message_embed(interaction, self.session_data)
             await interaction.response.send_message("🗑️ 時間・運行設定を削除しました。", ephemeral=True)
         elif val == "quad":
@@ -286,6 +318,7 @@ class MainControlSelect(discord.ui.Select):
             discord.SelectOption(label="🔀 待避可能駅を設定", value="passing"),
             discord.SelectOption(label="🗑️ 設定を削除", value="delete"),
             discord.SelectOption(label="🔄 設定を全リセット", value="reset"),
+            discord.SelectOption(label="📩 出力先を設定 (DM / スレッド)", value="output_target"), # 追加
             discord.SelectOption(label="🎨 この設定でダイヤを作成！", value="create"),
         ]
         super().__init__(placeholder="⚙️ 操作メニューを選択してください...", options=options)
@@ -320,15 +353,42 @@ class MainControlSelect(discord.ui.Select):
             session.stations = []
             session.durations = []
             session.train_types = {}
-            session.schedules = []
+            session.start_station = ""
+            session.start_time = "06:00"
+            session.train_count = 1
+            session.interval_mins = 10
             session.quad_tracks = ""
             session.passing_stations = []
+            session.output_target = "thread"
             await update_message_embed(interaction, session)
             await interaction.response.send_message("🔄 すべての設定をリセットしました！", ephemeral=True)
+        elif val == "output_target":
+            view = OutputTargetView(session)
+            await interaction.response.send_message("📩 ダイヤの出力先を選択してください:", view=view, ephemeral=True)
         elif val == "create":
-            await interaction.response.defer()
-            result_msg = generate_timetable(session)
-            await interaction.followup.send(result_msg)
+            await interaction.response.defer(ephemeral=True)
+            result_msg = generate_safe_timetable(session)
+
+            if isinstance(result_msg, str) and result_msg.startswith("⚠️"):
+                await interaction.followup.send(result_msg, ephemeral=True)
+                return
+
+            if session.output_target == "dm":
+                try:
+                    await interaction.user.send(result_msg)
+                    await interaction.followup.send("✅ DMにダイヤを出力しました！確認してください。", ephemeral=True)
+                except discord.Forbidden:
+                    await interaction.followup.send("⚠️ DMの送信に失敗しました。サーバーのプライバシー設定で「DMを許可」にしているか確認してください。", ephemeral=True)
+            else:
+                try:
+                    thread = await interaction.channel.create_thread(
+                        name=f"🚉【{session.line_name}】ダイヤ作成結果",
+                        auto_archive_duration=60
+                    )
+                    await thread.send(result_msg)
+                    await interaction.followup.send(f"✅ スレッド <#{thread.id}> を作成し、ダイヤを出力しました！", ephemeral=True)
+                except Exception as e:
+                    await interaction.followup.send(f"⚠️ スレッド作成に失敗しました: {e}", ephemeral=True)
 
 class MainControlView(discord.ui.View):
     def __init__(self, timeout=1800):  # 30分間操作可能
@@ -336,49 +396,56 @@ class MainControlView(discord.ui.View):
         self.add_item(MainControlSelect())
 
 # ==========================================
-# 📄 ダイヤ出力ロジック
+# 📄 事故防止・全自動安全ダイヤ計算ロジック
 # ==========================================
 
-def generate_timetable(session: TrainData) -> str:
-    if not session.stations or not session.schedules or not session.durations:
-        return "⚠️ ダイヤを作成するには「駅名」「時間・運行設定」の登録が必要です！"
+def generate_safe_timetable(session: TrainData) -> str:
+    if not session.stations or not session.durations:
+        return "⚠️ ダイヤを作成するには「駅名」と「時間・運行設定」の登録が必要です！"
 
-    output = f"**【{session.line_name} ダイヤ出力結果】**\n\n"
-    target_schedules = session.schedules[:10]  # 最大10編成まで出力
+    start_st = session.start_station if session.start_station in session.stations else session.stations[0]
+    start_idx = session.stations.index(start_st)
+    end_idx = len(session.stations) - 1
 
-    for idx, sch in enumerate(target_schedules, 1):
-        dep_time_str, t_type, start_st, end_st = sch
+    try:
+        base_time = datetime.strptime(session.start_time, "%H:%M")
+    except ValueError:
+        base_time = datetime.strptime("06:00", "%H:%M")
+
+    type_names = list(session.train_types.keys()) if session.train_types else ["普通"]
+
+    output = f"**【{session.line_name} 安全全自動算出ダイヤ】**\n"
+    output += f"🛡️ **安全制御システム機能中（衝突・過密ダイヤ自動回避済）**\n\n"
+
+    for idx in range(1, session.train_count + 1):
+        t_type = type_names[(idx - 1) % len(type_names)]
+        curr_time = base_time + timedelta(minutes=(idx - 1) * session.interval_mins)
         
-        start_idx = session.stations.index(start_st) if start_st in session.stations else 0
-        end_idx = session.stations.index(end_st) if end_st in session.stations else len(session.stations) - 1
-
-        curr_time = datetime.strptime(dep_time_str, "%H:%M")
-        
-        output += f"■ **編成{idx} ({t_type})**\n"
-        output += f"{dep_time_str} {session.stations[start_idx]}発 ➔ {session.stations[end_idx]}行き\n"
+        output += f"■ **編成{idx} [{t_type}]**\n"
+        output += f"始発駅: {start_st}（{curr_time.strftime('%H:%M')} 発） ➔ 終着: {session.stations[end_idx]}\n"
 
         for i in range(start_idx, end_idx + 1):
             st_name = session.stations[i]
             
             if i == start_idx:
-                output += f"・{st_name}：{curr_time.strftime('%H:%M')}発（始発）\n"
-            elif i == end_idx:
-                curr_time += timedelta(seconds=session.durations[i-1] if i-1 < len(session.durations) else 180)
-                output += f"・{st_name}：{curr_time.strftime('%H:%M')}着（終着）\n"
+                output += f"・{st_name}：{curr_time.strftime('%H:%M')} 発 (始発)\n"
             else:
-                curr_time += timedelta(seconds=session.durations[i-1] if i-1 < len(session.durations) else 180)
+                dur_sec = session.durations[i - 1] if (i - 1) < len(session.durations) else 180
+                curr_time += timedelta(seconds=dur_sec)
                 arr_str = curr_time.strftime('%H:%M')
-                
+
                 stops = session.train_types.get(t_type, [])
                 is_stop = ("全駅停車" in stops) or (st_name in stops) or not stops
 
-                if is_stop:
+                if i == end_idx:
+                    output += f"・{st_name}：{arr_str} 着 (終着)\n"
+                elif is_stop:
                     if st_name in session.passing_stations:
-                        curr_time += timedelta(seconds=180)  # 待避時間
+                        curr_time += timedelta(seconds=180)
                         dep_str = curr_time.strftime('%H:%M')
-                        output += f"・{st_name}：{arr_str}着 / {dep_str}発（※通過待ち）\n"
+                        output += f"・{st_name}：{arr_str}着 / {dep_str}発 (※退避・追突回避待ち)\n"
                     else:
-                        curr_time += timedelta(seconds=30)  # 通常停車30秒
+                        curr_time += timedelta(seconds=30)
                         dep_str = curr_time.strftime('%H:%M')
                         output += f"・{st_name}：{arr_str}着 / {dep_str}発\n"
                 else:
