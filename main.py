@@ -411,7 +411,6 @@ class MainControlSelect(discord.ui.Select):
                         await interaction.user.send(msg)
                     await interaction.followup.send("✅ DMにダイヤを出力しました！確認してください。", ephemeral=True)
                 except (discord.Forbidden, Exception):
-                    # DM受信オフやブロック等の理由で送信不可の場合、チャンネル直投に切り替え
                     try:
                         for msg in result_msgs:
                             await interaction.channel.send(msg)
@@ -430,7 +429,6 @@ class MainControlSelect(discord.ui.Select):
                         await thread.send(msg)
                     await interaction.followup.send(f"✅ スレッド {thread.mention} を作成し、ダイヤを出力しました！", ephemeral=True)
                 except (discord.Forbidden, Exception):
-                    # スレッド作成権限がない場合、チャンネル直投に切り替え
                     try:
                         for msg in result_msgs:
                             await interaction.channel.send(msg)
@@ -554,8 +552,38 @@ def generate_safe_timetable(session: TrainData) -> list[str]:
     return messages
 
 # ==========================================
-# 👑 管理者パネル & コマンド群
+# 👑 管理者パネル & リスト表示
 # ==========================================
+
+def generate_admin_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="👑 BOT 管理用コントロールパネル",
+        description="下のボタンを押して各種操作を行ってください。",
+        color=0xe74c3c
+    )
+    
+    # ⛔ ブラックリスト サーバー一覧
+    if blacklisted_servers:
+        bl_text = "\n".join([f"・{name} (`ID: {sid}`)" for sid, name in blacklisted_servers.items()])
+    else:
+        bl_text = "なし"
+    embed.add_field(name="⛔ Blacklist Servers", value=bl_text, inline=False)
+
+    # 🚫 BOTBAN ユーザー一覧
+    if banned_users:
+        ban_text = "\n".join([f"・{name} (`ID: {uid}`)" for uid, name in banned_users.items()])
+    else:
+        ban_text = "なし"
+    embed.add_field(name="🚫 Banned Users", value=ban_text, inline=False)
+
+    # 👑 管理者 ユーザー一覧
+    if admin_users:
+        admin_text = "\n".join([f"・{name} (`ID: {uid}`)" for uid, name in admin_users.items()])
+    else:
+        admin_text = "なし"
+    embed.add_field(name="👑 Admins", value=admin_text, inline=False)
+
+    return embed
 
 class AdminModal(discord.ui.Modal):
     def __init__(self, action_type: str, title_text: str, label_text: str):
@@ -582,11 +610,11 @@ class AdminModal(discord.ui.Modal):
             blacklisted_servers[target_id] = g_name
             if guild:
                 await guild.leave()
-            await interaction.response.send_message(f"⛔ サーバー (ID: {target_id}) をブラックリストに追加・脱出しました。", ephemeral=True)
+            msg = f"⛔ サーバー 『{g_name}』 (ID: {target_id}) をブラックリストに追加・脱出しました。"
 
         elif self.action_type == "unblacklist":
             blacklisted_servers.pop(target_id, None)
-            await interaction.response.send_message(f"🟢 サーバー (ID: {target_id}) のブラックリストを解除しました。", ephemeral=True)
+            msg = f"🟢 サーバー (ID: {target_id}) のブラックリストを解除しました。"
 
         elif self.action_type == "botban":
             try:
@@ -595,11 +623,11 @@ class AdminModal(discord.ui.Modal):
             except:
                 u_name = "Unknown User"
             banned_users[target_id] = u_name
-            await interaction.response.send_message(f"🚫 ユーザー {u_name} (ID: {target_id}) をBOTBANしました。", ephemeral=True)
+            msg = f"🚫 ユーザー 『{u_name}』 (ID: {target_id}) をBOTBANしました。"
 
         elif self.action_type == "unbotban":
             banned_users.pop(target_id, None)
-            await interaction.response.send_message(f"⭕ ユーザー (ID: {target_id}) のBOTBANを解除しました。", ephemeral=True)
+            msg = f"⭕ ユーザー (ID: {target_id}) のBOTBANを解除しました。"
 
         elif self.action_type == "add_admin":
             try:
@@ -608,14 +636,23 @@ class AdminModal(discord.ui.Modal):
             except:
                 u_name = "Unknown User"
             admin_users[target_id] = u_name
-            await interaction.response.send_message(f"👑 ユーザー {u_name} (ID: {target_id}) を管理者に設定しました。", ephemeral=True)
+            msg = f"👑 ユーザー 『{u_name}』 (ID: {target_id}) を管理者に設定しました。"
 
         elif self.action_type == "fire":
             if target_id == OWNER_ID:
                 await interaction.response.send_message("⚠️ Bot作成者（Owner）の権限は解除できません！", ephemeral=True)
                 return
             admin_users.pop(target_id, None)
-            await interaction.response.send_message(f"🔥 ユーザー (ID: {target_id}) の管理者権限を解除しました。", ephemeral=True)
+            msg = f"🔥 ユーザー (ID: {target_id}) の管理者権限を解除しました。"
+
+        # 管理者パネルの表示を最新情報に自動更新
+        if interaction.message:
+            try:
+                await interaction.message.edit(embed=generate_admin_embed())
+            except Exception as e:
+                print(f"Panel embed update failed: {e}")
+
+        await interaction.response.send_message(msg, ephemeral=True)
 
 class AdminPanelView(discord.ui.View):
     def __init__(self):
@@ -643,7 +680,11 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="FIRE", style=discord.ButtonStyle.secondary, custom_id="btn_fire")
     async def btn_fire(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AdminModal("fire", "FIRE", "どのユーザーの管理者権限を解除しましたか？"))
+        await interaction.response.send_modal(AdminModal("fire", "FIRE", "どのユーザーの管理者権限を解除しますか？"))
+
+# ==========================================
+# 💬 コマンド定義
+# ==========================================
 
 @bot.tree.command(name="create", description="路線ダイヤの作成を開始します")
 @app_commands.describe(路線名="ダイヤを作成する路線名を入力")
@@ -664,8 +705,9 @@ async def create(interaction: discord.Interaction, 路線名: str):
     msg = await interaction.original_response()
     user_sessions[msg.id] = session_data
 
-@bot.tree.command(name="botinfo", description="Botの稼働状況やシステム情報を表示します")
-async def botinfo_slash(interaction: discord.Interaction):
+# !botinfo (通常コマンドに変更)
+@bot.command(name="botinfo")
+async def botinfo(ctx):
     uptime = datetime.now() - START_TIME
     hours, remainder = divmod(int(uptime.total_seconds()), 3600)
     minutes, _ = divmod(remainder, 60)
@@ -691,18 +733,14 @@ async def botinfo_slash(interaction: discord.Interaction):
     error_display = "\n".join(ERROR_LOGS[-3:]) if ERROR_LOGS else "なし"
     embed.add_field(name="📋 直近のエラーログ（最大3件）", value=f"```\n{error_display}\n```", inline=False)
     
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await ctx.send(embed=embed)
 
-# 管理者用 隠しコマンド
+# 管理者用 コントロールパネル コマンド
 @bot.command(name="adminpanel")
 async def adminpanel(ctx):
     if ctx.author.id not in admin_users:
         return
-    embed = discord.Embed(
-        title="👑 BOT 管理用コントロールパネル",
-        description="下のボタンを押して各種操作を行ってください。",
-        color=0xe74c3c
-    )
+    embed = generate_admin_embed()
     await ctx.send(embed=embed, view=AdminPanelView())
 
 # Bot 起動時イベント
