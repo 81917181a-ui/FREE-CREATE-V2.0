@@ -62,12 +62,12 @@ class TrainData:
         self.start_stations = []       # 始発駅リスト（複数対応）
         self.end_station = ""          # 終了駅（任意）
         self.start_time = "06:00"      # 開始時間
-        self.round_trips = 1           # 往復数（何往復か）
-        self.interval_mins = 3         # 運行間隔（分）
+        self.round_trips = 1           # 往復数
+        self.interval_mins = 3         # 運行間隔
         self.turnaround_mins = 3       # 折り返し時間（分・最大10分制御）
         self.quad_tracks = ""
         self.passing_stations = []
-        self.output_target = "thread"  # "thread" または "dm"
+        self.output_target = "thread"  # "thread", "dm", "channel"
 
 user_sessions = {}  # {message_id: TrainData}
 
@@ -85,9 +85,14 @@ def generate_status_embed(session: TrainData) -> discord.Embed:
 
     passing_text = ", ".join(session.passing_stations) if session.passing_stations else "なし"
     quad_text = session.quad_tracks if session.quad_tracks else "なし"
-    target_disp = "🧵 スレッドに送信" if session.output_target == "thread" else "📩 DMに送信"
+    
+    target_map = {
+        "thread": "🧵 スレッドに送信",
+        "dm": "📩 DMに送信",
+        "channel": "💬 現在のチャンネルに直接送信"
+    }
+    target_disp = target_map.get(session.output_target, "🧵 スレッドに送信")
 
-    # 折返し時間の制限表示 (1〜10分)
     turnaround_disp = min(max(1, session.turnaround_mins), 10)
 
     embed = discord.Embed(
@@ -196,7 +201,6 @@ class TimeModal(discord.ui.Modal, title="⏱️ 時間・運行・過密設定")
         if len(trip_parts) >= 1:
             self.session_data.round_trips = trip_parts[0]
         if len(trip_parts) >= 2:
-            # 10分を超える入力がされても強制的に最大10分に制限
             self.session_data.turnaround_mins = min(trip_parts[1], 10)
 
         await update_message_embed(interaction, self.session_data)
@@ -245,7 +249,7 @@ class PassingModal(discord.ui.Modal, title="🔀 待避可能駅を設定"):
         await interaction.response.send_message("✅ 待避可能駅を設定しました！", ephemeral=True)
 
 # ==========================================
-# 📩 出力先選択 View
+# 📩 出力先選択 View（3つの出力先に対応）
 # ==========================================
 
 class OutputTargetView(discord.ui.View):
@@ -253,17 +257,23 @@ class OutputTargetView(discord.ui.View):
         super().__init__(timeout=60)
         self.session_data = session_data
 
-    @discord.ui.button(label="🧵 チャンネル内にスレッドを作成して出力", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🧵 スレッドを作成して出力", style=discord.ButtonStyle.primary)
     async def select_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.session_data.output_target = "thread"
         await update_message_embed(interaction, self.session_data)
         await interaction.response.send_message("✅ ダイヤの出力先を **スレッド** に設定しました！", ephemeral=True)
 
-    @discord.ui.button(label="📩 個人の DM (ダイレクトメッセージ) に出力", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="📩 DM (ダイレクトメッセージ) に出力", style=discord.ButtonStyle.success)
     async def select_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.session_data.output_target = "dm"
         await update_message_embed(interaction, self.session_data)
         await interaction.response.send_message("✅ ダイヤの出力先を **DM** に設定しました！", ephemeral=True)
+
+    @discord.ui.button(label="💬 現在のチャンネルに送信", style=discord.ButtonStyle.secondary)
+    async def select_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.session_data.output_target = "channel"
+        await update_message_embed(interaction, self.session_data)
+        await interaction.response.send_message("✅ ダイヤの出力先を **現在のチャンネル** に設定しました！", ephemeral=True)
 
 # ==========================================
 # 🗑️ ダイヤ用 削除ドロップダウン
@@ -338,7 +348,7 @@ class MainControlSelect(discord.ui.Select):
             discord.SelectOption(label="🔀 待避可能駅を設定", value="passing"),
             discord.SelectOption(label="🗑️ 設定を削除", value="delete"),
             discord.SelectOption(label="🔄 設定を全リセット", value="reset"),
-            discord.SelectOption(label="📩 出力先を設定 (DM / スレッド)", value="output_target"),
+            discord.SelectOption(label="📩 出力先を設定 (スレッド/DM/チャンネル)", value="output_target"),
             discord.SelectOption(label="🎨 この設定でダイヤを作成！", value="create"),
         ]
         super().__init__(placeholder="⚙️ 操作メニューを選択してください...", options=options)
@@ -388,28 +398,54 @@ class MainControlSelect(discord.ui.Select):
             await interaction.response.send_message("📩 ダイヤの出力先を選択してください:", view=view, ephemeral=True)
         elif val == "create":
             await interaction.response.defer(ephemeral=True)
-            result_msg = generate_safe_timetable(session)
+            result_msgs = generate_safe_timetable(session)
 
-            if isinstance(result_msg, str) and result_msg.startswith("⚠️"):
-                await interaction.followup.send(result_msg, ephemeral=True)
+            if len(result_msgs) == 1 and result_msgs[0].startswith("⚠️"):
+                await interaction.followup.send(result_msgs[0], ephemeral=True)
                 return
 
+            # --- 1. DM 送信（失敗時はチャンネルへフォールバック） ---
             if session.output_target == "dm":
                 try:
-                    await interaction.user.send(result_msg)
+                    for msg in result_msgs:
+                        await interaction.user.send(msg)
                     await interaction.followup.send("✅ DMにダイヤを出力しました！確認してください。", ephemeral=True)
-                except discord.Forbidden:
-                    await interaction.followup.send("⚠️ DMの送信に失敗しました。サーバーのプライバシー設定で「DMを許可」にしているか確認してください。", ephemeral=True)
-            else:
+                except (discord.Forbidden, Exception):
+                    # DM受信オフやブロック等の理由で送信不可の場合、チャンネル直投に切り替え
+                    try:
+                        for msg in result_msgs:
+                            await interaction.channel.send(msg)
+                        await interaction.followup.send("⚠️ DMが受信拒否設定になっているため、このチャンネルに直接出力しました！", ephemeral=True)
+                    except Exception as send_err:
+                        await interaction.followup.send(f"⚠️ ダイヤの出力に失敗しました。Botのメッセージ送信権限を確認してください: {send_err}", ephemeral=True)
+
+            # --- 2. スレッド送信（失敗時はチャンネルへフォールバック） ---
+            elif session.output_target == "thread":
                 try:
                     thread = await interaction.channel.create_thread(
                         name=f"🚉【{session.line_name}】ダイヤ作成結果",
                         auto_archive_duration=60
                     )
-                    await thread.send(result_msg)
-                    await interaction.followup.send(f"✅ スレッド <#{thread.id}> を作成し、ダイヤを出力しました！", ephemeral=True)
-                except Exception as e:
-                    await interaction.followup.send(f"⚠️ スレッド作成に失敗しました: {e}", ephemeral=True)
+                    for msg in result_msgs:
+                        await thread.send(msg)
+                    await interaction.followup.send(f"✅ スレッド {thread.mention} を作成し、ダイヤを出力しました！", ephemeral=True)
+                except (discord.Forbidden, Exception):
+                    # スレッド作成権限がない場合、チャンネル直投に切り替え
+                    try:
+                        for msg in result_msgs:
+                            await interaction.channel.send(msg)
+                        await interaction.followup.send("⚠️ スレッド作成権限がないため、このチャンネルに直接出力しました！", ephemeral=True)
+                    except Exception as send_err:
+                        await interaction.followup.send(f"⚠️ ダイヤの出力に失敗しました。Botのメッセージ送信権限を確認してください: {send_err}", ephemeral=True)
+
+            # --- 3. 現在のチャンネルに直接送信 ---
+            else:
+                try:
+                    for msg in result_msgs:
+                        await interaction.channel.send(msg)
+                    await interaction.followup.send("✅ このチャンネルにダイヤを出力しました！", ephemeral=True)
+                except Exception as send_err:
+                    await interaction.followup.send(f"⚠️ ダイヤの出力に失敗しました: {send_err}", ephemeral=True)
 
 class MainControlView(discord.ui.View):
     def __init__(self, timeout=1800):
@@ -417,12 +453,12 @@ class MainControlView(discord.ui.View):
         self.add_item(MainControlSelect())
 
 # ==========================================
-# 📄 発車10分以内制御つき 過密ダイヤ計算
+# 📄 発車10分以内制御 & 2000文字分割対応 ダイヤ計算
 # ==========================================
 
-def generate_safe_timetable(session: TrainData) -> str:
+def generate_safe_timetable(session: TrainData) -> list[str]:
     if not session.stations or not session.durations:
-        return "⚠️ ダイヤを作成するには「駅名」と「時間・運行設定」の登録が必要です！"
+        return ["⚠️ ダイヤを作成するには「駅名」と「時間・運行設定」の登録が必要です！"]
 
     start_sts = session.start_stations if session.start_stations else [session.stations[0]]
     end_st = session.end_station if session.end_station in session.stations else session.stations[-1]
@@ -433,12 +469,11 @@ def generate_safe_timetable(session: TrainData) -> str:
         base_time = datetime.strptime("06:00", "%H:%M")
 
     type_names = list(session.train_types.keys()) if session.train_types else ["普通"]
-
-    # 折り返し間隔・停車間隔を「最大10分以内」に制御
     safe_turnaround = min(max(1, session.turnaround_mins), 10)
 
-    output = f"**【{session.line_name} 高密度過密ダイヤ (全列車10分以内発車制御)】**\n"
-    output += f"⏱️ **発車間隔制御：到着・折り返し後【最大10分以内】に即時発車**\n\n"
+    messages = []
+    current_msg = f"**【{session.line_name} 高密度過密ダイヤ (全列車10分以内発車制御)】**\n"
+    current_msg += f"⏱️ **発車間隔制御：到着・折り返し後【最大10分以内】に即時発車**\n\n"
 
     for st_idx, start_st in enumerate(start_sts):
         if start_st not in session.stations:
@@ -451,20 +486,19 @@ def generate_safe_timetable(session: TrainData) -> str:
             s_idx, e_idx = e_idx, s_idx
 
         t_type = type_names[st_idx % len(type_names)]
-        # 複数系統の発車間隔も最大10分以内（ここでは2分ずらし）
         curr_time = base_time + timedelta(minutes=min(st_idx * 2, 10))
 
-        output += f"===============================\n"
-        output += f"🚩 **【系統 {st_idx + 1}】始発: {start_st} ➔ 終了: {end_st} ({session.round_trips}往復)**\n"
-        output += f"===============================\n"
+        section_text = f"===============================\n"
+        section_text += f"🚩 **【系統 {st_idx + 1}】始発: {start_st} ➔ 終了: {end_st} ({session.round_trips}往復)**\n"
+        section_text += f"===============================\n"
 
         for trip in range(1, session.round_trips + 1):
             # --- 往路 ---
-            output += f"🔹 **[{trip}往路] 種別: {t_type}**（{start_st} {curr_time.strftime('%H:%M')}発）\n"
+            section_text += f"🔹 **[{trip}往路] 種別: {t_type}**（{start_st} {curr_time.strftime('%H:%M')}発）\n"
             for i in range(s_idx, e_idx + 1):
                 st_name = session.stations[i]
                 if i == s_idx:
-                    output += f"  ・{st_name}：{curr_time.strftime('%H:%M')} 発 (始発)\n"
+                    section_text += f"  ・{st_name}：{curr_time.strftime('%H:%M')} 発 (始発)\n"
                 else:
                     dur_sec = session.durations[i - 1] if (i - 1) < len(session.durations) else 180
                     curr_time += timedelta(seconds=dur_sec)
@@ -473,23 +507,21 @@ def generate_safe_timetable(session: TrainData) -> str:
                     is_stop = ("全駅停車" in stops) or (st_name in stops) or not stops
 
                     if i == e_idx:
-                        output += f"  ・{st_name}：{arr_str} 着 (終着)\n"
+                        section_text += f"  ・{st_name}：{arr_str} 着 (終着)\n"
                     elif is_stop:
-                        # 停車時間は30秒（10分以内）
                         curr_time += timedelta(seconds=30)
-                        output += f"  ・{st_name}：{arr_str}着 / {curr_time.strftime('%H:%M')}発\n"
+                        section_text += f"  ・{st_name}：{arr_str}着 / {curr_time.strftime('%H:%M')}発\n"
                     else:
-                        output += f"  ・{st_name}：通過\n"
+                        section_text += f"  ・{st_name}：通過\n"
 
-            # 折返し時間の適用（最大10分以内）
             curr_time += timedelta(minutes=safe_turnaround)
 
             # --- 復路 ---
-            output += f"🔸 **[{trip}復路] 種別: {t_type}**（{end_st} {curr_time.strftime('%H:%M')}発 折返し）\n"
+            section_text += f"🔸 **[{trip}復路] 種別: {t_type}**（{end_st} {curr_time.strftime('%H:%M')}発 折返し）\n"
             for i in range(e_idx, s_idx - 1, -1):
                 st_name = session.stations[i]
                 if i == e_idx:
-                    output += f"  ・{st_name}：{curr_time.strftime('%H:%M')} 発 (折返始発)\n"
+                    section_text += f"  ・{st_name}：{curr_time.strftime('%H:%M')} 発 (折返始発)\n"
                 else:
                     dur_sec = session.durations[i] if i < len(session.durations) else 180
                     curr_time += timedelta(seconds=dur_sec)
@@ -498,18 +530,28 @@ def generate_safe_timetable(session: TrainData) -> str:
                     is_stop = ("全駅停車" in stops) or (st_name in stops) or not stops
 
                     if i == s_idx:
-                        output += f"  ・{st_name}：{arr_str} 着 (到着)\n"
+                        section_text += f"  ・{st_name}：{arr_str} 着 (到着)\n"
                     elif is_stop:
                         curr_time += timedelta(seconds=30)
-                        output += f"  ・{st_name}：{arr_str}着 / {curr_time.strftime('%H:%M')}発\n"
+                        section_text += f"  ・{st_name}：{arr_str}着 / {curr_time.strftime('%H:%M')}発\n"
                     else:
-                        output += f"  ・{st_name}：通過\n"
+                        section_text += f"  ・{st_name}：通過\n"
 
-            # 次の往路までの折返し待機（最大10分以内）
             curr_time += timedelta(minutes=safe_turnaround)
-            output += "\n"
+            section_text += "\n"
 
-    return output
+            # 1800文字超過で自動分割
+            if len(current_msg) + len(section_text) > 1800:
+                messages.append(current_msg)
+                current_msg = section_text
+                section_text = ""
+
+        current_msg += section_text
+
+    if current_msg.strip():
+        messages.append(current_msg)
+
+    return messages
 
 # ==========================================
 # 👑 管理者パネル & コマンド群
@@ -601,7 +643,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="FIRE", style=discord.ButtonStyle.secondary, custom_id="btn_fire")
     async def btn_fire(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AdminModal("fire", "FIRE", "どのユーザーの管理者権限を解除しますか？"))
+        await interaction.response.send_modal(AdminModal("fire", "FIRE", "どのユーザーの管理者権限を解除しましたか？"))
 
 @bot.tree.command(name="create", description="路線ダイヤの作成を開始します")
 @app_commands.describe(路線名="ダイヤを作成する路線名を入力")
@@ -648,36 +690,29 @@ async def botinfo_slash(interaction: discord.Interaction):
     
     error_display = "\n".join(ERROR_LOGS[-3:]) if ERROR_LOGS else "なし"
     embed.add_field(name="📋 直近のエラーログ（最大3件）", value=f"```\n{error_display}\n```", inline=False)
-    embed.set_footer(text=f"起動時刻: {START_TIME.strftime('%Y/%m/%d %H:%M:%S')}")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    await interaction.response.send_message(embed=embed)
-
+# 管理者用 隠しコマンド
 @bot.command(name="adminpanel")
 async def adminpanel(ctx):
     if ctx.author.id not in admin_users:
-        await ctx.send("⚠️ このコマンドを実行する権限がありません。")
         return
-
-    bl_text = "\n".join([f"・{name} (ID: {sid})" for sid, name in blacklisted_servers.items()]) or "なし"
-    ban_text = "\n".join([f"・{name} (ID: {uid})" for uid, name in banned_users.items()]) or "なし"
-    admin_text = "\n".join([f"・{name} (ID: {uid})" for uid, name in admin_users.items()]) or "なし"
-
-    embed = discord.Embed(title="## [アドミンパネルです]", color=0x9b59b6)
-    embed.add_field(name="BLACKLIST:", value=bl_text, inline=False)
-    embed.add_field(name="CANT USE:", value=ban_text, inline=False)
-    embed.add_field(name="IS ADMIN:", value=admin_text, inline=False)
-
+    embed = discord.Embed(
+        title="👑 BOT 管理用コントロールパネル",
+        description="下のボタンを押して各種操作を行ってください。",
+        color=0xe74c3c
+    )
     await ctx.send(embed=embed, view=AdminPanelView())
 
-@bot.event
-async def on_guild_join(guild):
-    if guild.id in blacklisted_servers:
-        await guild.leave()
-
+# Bot 起動時イベント
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
 
-if __name__ == "__main__":
-    bot.run(TOKEN)
+bot.run(TOKEN)
