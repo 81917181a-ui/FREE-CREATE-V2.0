@@ -22,7 +22,6 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# Flaskを裏で別スレッド起動
 Thread(target=run_flask).start()
 
 # ==========================================
@@ -45,7 +44,7 @@ blacklisted_servers = {}  # {server_id: server_name}
 banned_users = {}         # {user_id: user_name}
 admin_users = {OWNER_ID: "Owner"} # {user_id: user_name}
 
-# 入力整形ユーティリティ（カンマ・読点の表記揺れ吸収）
+# 入力整形ユーティリティ
 def normalize_input(text: str) -> list[str]:
     if not text:
         return []
@@ -65,6 +64,56 @@ class TrainData:
         self.passing_stations = []
 
 user_sessions = {}  # {message_id: TrainData}
+
+# ==========================================
+# 📊 Embed リアルタイム更新用関数
+# ==========================================
+def generate_status_embed(session: TrainData) -> discord.Embed:
+    stations_text = ", ".join(session.stations) if session.stations else "未設定"
+    types_text = ", ".join(session.train_types.keys()) if session.train_types else "未設定"
+    durations_text = ", ".join(map(str, session.durations)) + "秒" if session.durations else "未設定"
+    
+    # 始発駅・終着駅・運行列車の表示
+    if session.schedules:
+        sch_list = []
+        for time_str, t_type, start_st, end_st in session.schedules[:5]:  # 最新5件まで表示
+            start_disp = start_st if start_st else (session.stations[0] if session.stations else "始発駅未定")
+            end_disp = end_st if end_st else (session.stations[-1] if session.stations else "終着駅未定")
+            sch_list.append(f"`{time_str}` {t_type} 【{start_disp} ➔ {end_disp}】")
+        
+        schedules_text = "\n・".join(sch_list)
+        if len(session.schedules) > 5:
+            schedules_text += f"\n...他 {len(session.schedules) - 5} 本"
+    else:
+        schedules_text = "なし"
+
+    passing_text = ", ".join(session.passing_stations) if session.passing_stations else "なし"
+    quad_text = session.quad_tracks if session.quad_tracks else "なし"
+
+    embed = discord.Embed(
+        title=f"🚉 {session.line_name} のダイヤを作成中",
+        description=(
+            "**現在の設定:**\n"
+            f"・駅名: {stations_text}\n"
+            f"・種別: {types_text}\n"
+            f"・区間所要時間: {durations_text}\n"
+            f"・始発駅・終着駅・運行列車:\n・{schedules_text}\n"
+            f"・待避可能駅: {passing_text}\n"
+            f"・複々線区間: {quad_text}\n\n"
+            "───────────────────\n"
+            "👇 **行いたい操作を選択してください**"
+        ),
+        color=0x3498db
+    )
+    return embed
+
+# メッセージ編集用共通関数
+async def update_message_embed(interaction: discord.Interaction, session: TrainData):
+    try:
+        new_embed = generate_status_embed(session)
+        await interaction.message.edit(embed=new_embed)
+    except Exception as e:
+        print(f"Embed update failed: {e}")
 
 # ==========================================
 # ⚙️ ダイヤ作成用 モーダル（入力フォーム）
@@ -87,7 +136,8 @@ class StationModal(discord.ui.Modal, title="🚉 駅名を登録・編集"):
         if len(stations) > 50:
             await interaction.response.send_message("⚠️ 駅数は最大50駅までです！", ephemeral=True)
             return
-        self.session_data.stations = stations  # 上書き
+        self.session_data.stations = stations
+        await update_message_embed(interaction, self.session_data)
         await interaction.response.send_message("✅ 駅名を登録・更新しました！", ephemeral=True)
 
 class TimeModal(discord.ui.Modal, title="⏱️ 時間・運行設定"):
@@ -119,8 +169,9 @@ class TimeModal(discord.ui.Modal, title="⏱️ 時間・運行設定"):
                 end_st = items[3] if len(items) > 3 else None
                 schedules.append((time_str, t_type, start_st, end_st))
 
-        self.session_data.durations = durations  # 上書き
-        self.session_data.schedules = schedules  # 上書き
+        self.session_data.durations = durations
+        self.session_data.schedules = schedules
+        await update_message_embed(interaction, self.session_data)
         await interaction.response.send_message("✅ 時間・運行設定を更新しました！", ephemeral=True)
 
 class TypeAddModal(discord.ui.Modal, title="➕ 列車種別を追加"):
@@ -137,7 +188,8 @@ class TypeAddModal(discord.ui.Modal, title="➕ 列車種別を追加"):
             return
         t_name = self.type_name.value.strip()
         stop_list = normalize_input(self.stops.value)
-        self.session_data.train_types[t_name] = stop_list  # 追加・更新
+        self.session_data.train_types[t_name] = stop_list
+        await update_message_embed(interaction, self.session_data)
         await interaction.response.send_message(f"✅ 種別『{t_name}』を追加しました！", ephemeral=True)
 
 class QuadTrackModal(discord.ui.Modal, title="🛤️ 複々線区間を設定"):
@@ -148,7 +200,8 @@ class QuadTrackModal(discord.ui.Modal, title="🛤️ 複々線区間を設定")
         self.session_data = session_data
 
     async def on_submit(self, interaction: discord.Interaction):
-        self.session_data.quad_tracks = self.quad_input.value.strip()  # 上書き
+        self.session_data.quad_tracks = self.quad_input.value.strip()
+        await update_message_embed(interaction, self.session_data)
         await interaction.response.send_message("✅ 複々線区間を設定しました！", ephemeral=True)
 
 class PassingModal(discord.ui.Modal, title="🔀 待避可能駅を設定"):
@@ -159,7 +212,8 @@ class PassingModal(discord.ui.Modal, title="🔀 待避可能駅を設定"):
         self.session_data = session_data
 
     async def on_submit(self, interaction: discord.Interaction):
-        self.session_data.passing_stations = normalize_input(self.passing_input.value)  # 上書き
+        self.session_data.passing_stations = normalize_input(self.passing_input.value)
+        await update_message_embed(interaction, self.session_data)
         await interaction.response.send_message("✅ 待避可能駅を設定しました！", ephemeral=True)
 
 # ==========================================
@@ -182,16 +236,20 @@ class DeleteSelect(discord.ui.Select):
         val = self.values[0]
         if val == "stations":
             self.session_data.stations = []
+            await update_message_embed(interaction, self.session_data)
             await interaction.response.send_message("🗑️ 駅名設定を削除しました。", ephemeral=True)
         elif val == "times":
             self.session_data.durations = []
             self.session_data.schedules = []
+            await update_message_embed(interaction, self.session_data)
             await interaction.response.send_message("🗑️ 時間・運行設定を削除しました。", ephemeral=True)
         elif val == "quad":
             self.session_data.quad_tracks = ""
+            await update_message_embed(interaction, self.session_data)
             await interaction.response.send_message("🗑️ 複々線区間設定を削除しました。", ephemeral=True)
         elif val == "passing":
             self.session_data.passing_stations = []
+            await update_message_embed(interaction, self.session_data)
             await interaction.response.send_message("🗑️ 待避可能駅設定を削除しました。", ephemeral=True)
         elif val == "types":
             if not self.session_data.train_types:
@@ -211,6 +269,7 @@ class TypeDeleteSelect(discord.ui.Select):
         target = self.values[0]
         if target in self.session_data.train_types:
             del self.session_data.train_types[target]
+            await update_message_embed(interaction, self.session_data)
             await interaction.response.send_message(f"🗑️ 種別『{target}』を削除しました。", ephemeral=True)
 
 # ==========================================
@@ -264,6 +323,7 @@ class MainControlSelect(discord.ui.Select):
             session.schedules = []
             session.quad_tracks = ""
             session.passing_stations = []
+            await update_message_embed(interaction, session)
             await interaction.response.send_message("🔄 すべての設定をリセットしました！", ephemeral=True)
         elif val == "create":
             await interaction.response.defer()
@@ -276,7 +336,7 @@ class MainControlView(discord.ui.View):
         self.add_item(MainControlSelect())
 
 # ==========================================
-# 📄 ダイヤ出力ロジック（普通メッセージ形式）
+# 📄 ダイヤ出力ロジック
 # ==========================================
 
 def generate_timetable(session: TrainData) -> str:
@@ -435,25 +495,13 @@ async def create(interaction: discord.Interaction, 路線名: str):
         await interaction.response.send_message("⚠️ このサーバーでは Bot の利用が禁止されています。", ephemeral=True)
         return
 
+    session_data = TrainData(路線名, interaction.user.id)
+    embed = generate_status_embed(session_data)
     view = MainControlView(timeout=1800)
-    embed = discord.Embed(
-        title=f"{路線名} のダイヤを作成中",
-        description=(
-            "**現在の設定:**\n"
-            "・駅名: 未設定\n"
-            "・種別: 未設定\n"
-            "・区間所要時間: 未設定\n"
-            "・運行予定: なし\n"
-            "・待避可能駅: なし\n"
-            "・複々線区間: なし\n\n"
-            "───────────────────\n"
-            "👇 **行いたい操作を選択してください**"
-        ),
-        color=0x3498db
-    )
+
     await interaction.response.send_message(embed=embed, view=view)
     msg = await interaction.original_response()
-    user_sessions[msg.id] = TrainData(路線名, interaction.user.id)
+    user_sessions[msg.id] = session_data
 
 @bot.command(name="adminpanel")
 async def adminpanel(ctx):
