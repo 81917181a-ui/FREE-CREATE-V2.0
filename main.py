@@ -1033,6 +1033,143 @@ async def wolfend_command(interaction: discord.Interaction):
     if interaction.channel.id in active_games:
         del active_games[interaction.channel.id]
     await interaction.response.send_message("🛑 ホストによって人狼ゲームが強制終了されました。")
+
+# ==========================================
+# 🎮 ミニゲーム1: じゃんけん (/janken)
+# ==========================================
+class JankenView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=30.0)
+        self.user_id = user_id
+
+    @discord.ui.button(label="✊ グー", style=discord.ButtonStyle.primary, custom_id="rock")
+    async def rock_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.play(interaction, "✊ グー", "rock")
+
+    @discord.ui.button(label="✌️ チョキ", style=discord.ButtonStyle.primary, custom_id="scissors")
+    async def scissors_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.play(interaction, "✌️ チョキ", "scissors")
+
+    @discord.ui.button(label="🖐️ パー", style=discord.ButtonStyle.primary, custom_id="paper")
+    async def paper_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.play(interaction, "🖐️ パー", "paper")
+
+    async def play(self, interaction: discord.Interaction, user_choice_str, user_choice):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("これはあなたのゲームではありません！", ephemeral=True)
+            return
+
+        for item in self.children:
+            item.disabled = True
+
+        choices = {"rock": "✊ グー", "scissors": "✌️ チョキ", "paper": "🖐️ パー"}
+        bot_choice_key = random.choice(list(choices.keys()))
+        bot_choice_str = choices[bot_choice_key]
+
+        if user_choice == bot_choice_key:
+            result_title = "⚖️ あいこ！"
+            color = discord.Color.gold()
+        elif (
+            (user_choice == "rock" and bot_choice_key == "scissors") or
+            (user_choice == "scissors" and bot_choice_key == "paper") or
+            (user_choice == "paper" and bot_choice_key == "rock")
+        ):
+            result_title = "✨ あなたの勝ち！"
+            color = discord.Color.green()
+        else:
+            result_title = "💧 あなたの負け..."
+            color = discord.Color.red()
+
+        embed = discord.Embed(
+            title=f"✊ じゃんけん勝負: {result_title}",
+            description=f"あなた: {user_choice_str}\nボット: {bot_choice_str}",
+            color=color
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+@bot.tree.command(name="janken", description="ボットとシンプルにじゃんけん勝負！")
+async def janken_command(interaction: discord.Interaction):
+    view = JankenView(user_id=interaction.user.id)
+    embed = discord.Embed(
+        title="✊ じゃんけんゲーム",
+        description="下のボタンから出す手を選んでね！",
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, view=view)
+
+# ==========================================
+# 🎮 ミニゲーム2: おみくじ (/omikuji)
+# ==========================================
+@bot.tree.command(name="omikuji", description="今日の運勢を占うおみくじ！")
+async def omikuji_command(interaction: discord.Interaction):
+    results = [
+        ("大吉", "🌟 大吉！すべてが順調に進む最高の一日！", discord.Color.gold()),
+        ("中吉", "✨ 中吉！いいことがありそうな予感。", discord.Color.green()),
+        ("小吉", "🍀 小吉！ささやかな幸せが見つかるかも。", discord.Color.blue()),
+        ("吉", "⚡ 吉！安定した平穏な一日。", discord.Color.purple()),
+        ("末吉", "☔ 末吉！少し慎重にいこう。", discord.Color.dark_grey()),
+        ("凶", "⚠️ 凶！思わぬハプニングに気をつけて！", discord.Color.red())
+    ]
+    title, desc, color = random.choice(results)
+    embed = discord.Embed(
+        title=f"⛩️ おみくじ結果: 【{title}】",
+        description=f"占者: {interaction.user.mention}\n\n{desc}",
+        color=color
+    )
+    await interaction.response.send_message(embed=embed)
+
+# ==========================================
+# 🎮 ミニゲーム3: ロシアンルーレット (/russian)
+# ==========================================
+class RussianView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=30.0)
+        self.user_id = user_id
+        self.danger_slot = random.randint(1, 4)
+
+        for i in range(1, 5):
+            btn = discord.ui.Button(label=f"レバー {i}", style=discord.ButtonStyle.secondary, custom_id=str(i))
+            btn.callback = self.callback
+            self.add_item(btn)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("これはあなたのゲームではありません！", ephemeral=True)
+            return
+
+        selected = int(interaction.data["custom_id"])
+
+        for item in self.children:
+            item.disabled = True
+
+        if selected == self.danger_slot:
+            embed = discord.Embed(
+                title="💥 ドカーン！ハズレ（当たり）！",
+                description=f"レバー **{selected}** を引いたらハズレでした…！ざんねん！",
+                color=discord.Color.red()
+            )
+        else:
+            embed = discord.Embed(
+                title="🎉 セーフ！大当たり！",
+                description=f"レバー **{selected}** は安全でした！おめでとうございます！",
+                color=discord.Color.green()
+            )
+
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+@bot.tree.command(name="russian", description="4つのレバーから1つを選ぶロシアンルーレット！")
+async def russian_command(interaction: discord.Interaction):
+    view = RussianView(user_id=interaction.user.id)
+    embed = discord.Embed(
+        title="🔫 ロシアンルーレット",
+        description="4つのレバーの中に1つだけハズレ（爆発）があります。安全そうなレバーを選んでね！",
+        color=discord.Color.orange()
+    )
+    await interaction.response.send_message(embed=embed, view=view)
+
+
     
 # Bot 起動時イベント
 @bot.event
