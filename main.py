@@ -15,6 +15,9 @@ intents.members = True          # サーバーメンバーの取得に必須
 intents.message_content = True  # メッセージ内容の取得に必須
 intents.dm_messages = True      # DMの送受信に必須
 
+# 進行中の人狼ゲームを管理する辞書
+active_games = {} # {channel_id: WolfGameSession}
+
 # ボットの初期化（intents=intents を必ず渡してください）
 bot = commands.Bot(command_prefix="!", intents=intents)
 # ------------------------------
@@ -762,6 +765,7 @@ async def adminpanel(ctx):
         return
     embed = generate_admin_embed()
     await ctx.send(embed=embed, view=AdminPanelView())
+# 人狼ゲーム
 class WolfGameSession:
     def __init__(self, channel, players, host, bot):
         self.channel = channel
@@ -787,7 +791,6 @@ class WolfGameSession:
             try:
                 await p.send(f"🔒 【役職通知】\n今回のあなたの役職は【 **{role}** 】です！この内容は他の人には秘密にしてください。")
             except Exception as e:
-                # どんなエラーでDMが送れなかったのかコンソールに詳細を出力
                 print(f"[ERROR] {p.name} へのDM送信に失敗しました: {e}")
                 await self.channel.send(f"{p.mention} さんのDM送信に失敗しました（エラー: {e}）。設定を確認してください。", delete_after=15)
 
@@ -808,20 +811,20 @@ class WolfGameSession:
                     content == p.global_name or 
                     content == p.display_name or 
                     content == f"<@{p.id}>" or 
-                    content == str(p.id)):
+                    str(p.id) in content):
                     return True
             return False
 
         while self.is_running:
             try:
-                msg = await self.bot.wait_for('message', check=check)
+                msg = await self.bot.wait_for('message', check=check, timeout=120)
                 content = msg.content.strip()
                 for p in valid_targets:
                     if (content == p.name or 
                         content == p.global_name or 
                         content == p.display_name or 
                         content == f"<@{p.id}>" or 
-                        content == str(p.id)):
+                        str(p.id) in content):
                         return p
             except Exception as e:
                 print(f"[ERROR] wait_for 中にエラーが発生しました: {e}")
@@ -888,7 +891,7 @@ class WolfGameSession:
 
             morning_embed = discord.Embed(
                 title=f"☀️ 第{self.day_count}日目 - 朝が来ました",
-                description=f"昨夜の犠牲者が発見されました...\n\n惨たらしい姿で発見されたのは **{killed_target.mention}** さんでした。",
+                description=f"昨夜の犠牲者が見つかりました...\n\n惨たらしい姿で発見されたのは **{killed_target.mention}** さんでした。",
                 color=discord.Color.orange()
             )
             await self.channel.send(content=killed_target.mention, embed=morning_embed)
@@ -983,6 +986,8 @@ class WolfGameSession:
 
         if self.channel.id in active_games:
             del active_games[self.channel.id]
+
+
 @bot.tree.command(name="wolfgame", description="人狼ゲームの募集を開始します")
 async def wolfgame_command(interaction: discord.Interaction):
     if interaction.channel.id in active_games:
@@ -990,6 +995,7 @@ async def wolfgame_command(interaction: discord.Interaction):
         return
     view = WolfLobbyView(host=interaction.user)
     await interaction.response.send_message(embed=view.get_embed(), view=view)
+
 
 @bot.tree.command(name="wolfend", description="進行中の人狼ゲームを強制終了します")
 async def wolfend_command(interaction: discord.Interaction):
