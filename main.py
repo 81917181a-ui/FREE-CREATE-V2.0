@@ -740,7 +740,7 @@ async def search(interaction: discord.Interaction, キーワード: str):
     
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash",
             contents=キーワード,
         )
         answer_text = response.text
