@@ -916,7 +916,25 @@ async def create(interaction: discord.Interaction, 路線名: str):
     await interaction.response.send_message(embed=embed, view=view)
     msg = await interaction.original_response()
     user_sessions[msg.id] = session_data
-
+# ==========================================
+# 導入サーバー数と合計メンバー数を表示するコマンド (!servers)
+# ==========================================
+@bot.command(name="servers", description="ボットが導入されているサーバー数と合計人数を表示します")
+async def servers(ctx):
+    # 導入されている全サーバーの数を取得
+    guild_count = len(bot.guilds)
+    
+    # 導入されている全サーバーのメンバー数を重複なし/あり（今回は単純な合計）で計算
+    total_members = sum(guild.member_count for guild in bot.guilds if guild.member_count is not None)
+    
+    embed = discord.Embed(
+        title="📊 ボットの導入状況",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="導入サーバー数", value=f"**{guild_count}** サーバー", inline=False)
+    embed.add_field(name="合計メンバー数", value=f"**{total_members:,}** 人", inline=False)
+    
+    await ctx.send(embed=embed)
 # !botinfo (通常コマンドに変更)
 @bot.command(name="botinfo")
 async def botinfo(ctx):
