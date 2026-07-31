@@ -1,5 +1,5 @@
 # ==========================================
-# 🐺 人狼ゲーム システム（game.py用完全版・特定ID単騎スタート対応）
+# 🐺 人狼ゲーム システム（game.py用完全版）
 # ==========================================
 
 import discord
@@ -35,7 +35,6 @@ class WolfLobbyView(discord.ui.View):
             await interaction.response.send_message("ホストのみがスタートできます！", ephemeral=True)
             return
         
-        # 特定のユーザーID (1510405214811852900) の場合は1人でもスタート可能
         is_admin_user = (interaction.user.id == 1510405214811852900)
         min_players = 1 if is_admin_user else 4
 
@@ -66,7 +65,6 @@ class WolfGameSession:
         self.bot = bot
         self.is_running = True
         
-        # 参加者が1人の場合の例外処理（テスト用）：1人の場合は人狼としてスタート
         if len(players) == 1:
             roles_list = ["🐺 人狼"]
         else:
