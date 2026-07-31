@@ -502,6 +502,21 @@ async def wolfend_command(interaction: discord.Interaction):
     
     await interaction.response.send_message("🛑 ホストによって人狼ゲームが強制終了されました。")
 
+# ==========================================
+# ボットの単体起動用コード（ファイルの一番下に追加）
+# ==========================================
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    # setup関数を読み込んでCogとして登録
+    await setup(bot)
+    # スラッシュコマンドをDiscordに同期
+    await bot.tree.sync()
+    print(f"Logged in as {bot.user} (Cog単体起動モード)")
 @bot.event
 async def on_ready():
     await bot.tree.sync()
