@@ -973,6 +973,27 @@ class WolfGameSession:
 
         if self.channel.id in active_games:
             del active_games[self.channel.id]
+@bot.tree.command(name="wolfgame", description="人狼ゲームの募集を開始します")
+async def wolfgame_command(interaction: discord.Interaction):
+    if interaction.channel.id in active_games:
+        await interaction.response.send_message("このチャンネルではすでに人狼ゲームが進行中です！", ephemeral=True)
+        return
+    view = WolfLobbyView(host=interaction.user)
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
+
+@bot.tree.command(name="wolfend", description="進行中の人狼ゲームを強制終了します")
+async def wolfend_command(interaction: discord.Interaction):
+    session = active_games.get(interaction.channel.id)
+    if not session:
+        await interaction.response.send_message("このチャンネルで進行中の人狼ゲームはありません。", ephemeral=True)
+        return
+    if interaction.user != session.host and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("ゲームを強制終了できるのはホストまたは管理者のみです！", ephemeral=True)
+        return
+    session.is_running = False
+    if interaction.channel.id in active_games:
+        del active_games[interaction.channel.id]
+    await interaction.response.send_message("🛑 ホストによって人狼ゲームが強制終了されました。")
 # ==========================================
 # 🎮 ミニゲーム1: じゃんけん (/janken)
 # ==========================================
