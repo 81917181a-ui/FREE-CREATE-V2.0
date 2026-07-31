@@ -29,7 +29,8 @@ class WolfLobbyView(discord.ui.View):
             await interaction.followup.send("すでに参加しています！", ephemeral=True)
             return
         self.joined.append(interaction.user)
-        await interaction.edit_original_response(embed=self.get_embed(), view=self)
+        # defer後の編集には followup を使う
+        await interaction.followup.edit_message(message_id=interaction.message.id, embed=self.get_embed(), view=self)
 
     @discord.ui.button(label="スタート", style=discord.ButtonStyle.primary, custom_id="wolf_start")
     async def start_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -54,7 +55,8 @@ class WolfLobbyView(discord.ui.View):
             description=f"参加者: {', '.join([p.mention for p in self.joined])}\n\n各プレイヤーの **DM** に役職を送信しました。確認してください！",
             color=discord.Color.dark_purple()
         )
-        await interaction.edit_original_response(embed=start_embed, view=self)
+        # defer後の編集には followup を使う
+        await interaction.followup.edit_message(message_id=interaction.message.id, embed=start_embed, view=self)
         self.stop()
 
         session = WolfGameSession(interaction.channel, self.joined, self.host, interaction.client)
@@ -99,7 +101,6 @@ class WolfGameSession:
                 await self.channel.send(f"{p.mention} さんのDMが閉じているため役職を送信できませんでした！設定を確認してください。", delete_after=10)
 
     async def get_text_input(self, user, prompt_text, valid_targets):
-        """DMでメッセージ入力を受け付け、有効な対象プレイヤーを返す（タイムアウト・例外対策済み）"""
         try:
             await user.send(prompt_text)
         except Exception:
@@ -147,7 +148,6 @@ class WolfGameSession:
         while self.is_running:
             self.day_count += 1
             
-            # --- 🌙 夜のフェーズ ---
             wolves = [p for p in self.alive if self.roles[p] == "🐺 人狼"]
             seer = self.get_seer_player()
             
@@ -158,7 +158,6 @@ class WolfGameSession:
             )
             await self.channel.send(embed=night_embed)
 
-            # 1. 占い師の行動
             if seer and seer in self.alive:
                 seer_valid_targets = [p for p in self.alive if p != seer]
                 if seer_valid_targets:
@@ -178,7 +177,6 @@ class WolfGameSession:
                         except:
                             pass
 
-            # 2. 人狼の襲撃
             killed_target = None
             attack_failed = False
             valid_targets = [p for p in self.alive if self.roles[p] != "🐺 人狼"]
@@ -216,7 +214,6 @@ class WolfGameSession:
             if not killed_target and not attack_failed and self.alive:
                 killed_target = random.choice(valid_targets or self.alive)
 
-            # --- ☀️ 朝のフェーズ ---
             if attack_failed:
                 morning_embed = discord.Embed(
                     title=f"☀️ 第{self.day_count}日目 - 朝が来ました",
@@ -261,7 +258,6 @@ class WolfGameSession:
 
             if not self.is_running: break
 
-            # --- 🗣️ 昼の議論 ＆ ⚖️ 投票フェーズ ---
             disc_embed = discord.Embed(
                 title="🗣️ 昼の議論タイム",
                 description="生き残ったメンバーで自由に話し合い、誰が人狼か推理してください。\n（順番に各プレイヤーのDMに処刑投票用の案内が届きます）",
@@ -335,7 +331,6 @@ class WolfGameSession:
         if self.channel.id in active_games:
             del active_games[self.channel.id]
 
-# cogとして組み込む場合のセットアップ関数（3秒制限回避 defer対応）
 async def setup(bot):
     @bot.tree.command(name="wolfgame", description="人狼ゲームの募集を開始します")
     async def wolfgame_command(interaction: discord.Interaction):
