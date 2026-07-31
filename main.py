@@ -754,10 +754,38 @@ async def adminpanel(ctx):
     await ctx.send(embed=embed, view=AdminPanelView())
 
 # ==========================================
-# 🐺 人狼ゲーム システム（DMテキスト入力版）
+# 🐺 人狼ゲーム システム（チャンネル完結・番号ボタン選択版）
 # ==========================================
 
 active_games = {} # { channel_id: GameSession }
+
+class WolfNumberButtonView(discord.ui.View):
+    def __init__(self, valid_targets, voter, action_type):
+        super().__init__(timeout=600.0)
+        self.selected_target = None
+        self.voter = voter
+        self.action_type = action_type # "wolf" または "vote"
+
+        for idx, target in enumerate(valid_targets, start=1):
+            button = discord.ui.Button(
+                label=f"{idx}: {target.display_name}",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"target_{target.id}_{idx}"
+            )
+            button.callback = self.create_callback(target)
+            self.add_item(button)
+
+    def create_callback(self, target):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user != self.voter:
+                await interaction.response.send_message("これはあなた用のボタンではありません！", ephemeral=True)
+                return
+            
+            self.selected_target = target
+            action_name = "襲撃" if self.action_type == "wolf" else "投票"
+            await interaction.response.send_message(f"✅ 【 **{target.display_name}** 】への{action_name}を受け付けました。", ephemeral=True)
+            self.stop()
+        return callback
 
 class WolfLobbyView(discord.ui.View):
     def __init__(self, host):
@@ -794,7 +822,7 @@ class WolfLobbyView(discord.ui.View):
         
         start_embed = discord.Embed(
             title="🐺 人狼ゲームが開始されました！",
-            description=f"参加者: {', '.join([p.mention for p in self.joined])}\n\n各プレイヤーの **DM** に役職を送信しました。確認してください！",
+            description=f"参加者: {', '.join([p.mention for p in self.joined])}\n\n下のボタンから役職を確認してください！",
             color=discord.Color.dark_purple()
         )
         await interaction.response.edit_message(embed=start_embed, view=self)
@@ -824,66 +852,39 @@ class WolfGameSession:
                 return p
         return None
 
-    async def send_roles(self):
-        for p, role in self.roles.items():
-            try:
-                await p.send(f"🔒 【役職通知】\n今回のあなたの役職は【 **{role}** 】です！この内容は他の人には秘密にしてください。")
-            except:
-                await self.channel.send(f"{p.mention} さんのDMが閉じているため役職を送信できませんでした！設定を確認してください。", delete_after=10)
-
-    async def get_text_input(self, user, prompt_text, valid_targets):
-        """DMでメッセージ入力を受け付け、有効な対象プレイヤーを返す（制限時間なし）"""
-        try:
-            await user.send(prompt_text)
-        except Exception:
-            return None
-
-        def check(m):
-            if m.author != user or not isinstance(m.channel, discord.DMChannel):
-                return False
-            content = m.content.strip()
-            for p in valid_targets:
-                if (content == p.name or 
-                    content == p.global_name or 
-                    content == p.display_name or 
-                    content == f"<@{p.id}>" or 
-                    content == str(p.id)):
-                    return True
-            return False
-
-        while self.is_running:
-            try:
-                msg = await self.bot.wait_for('message', check=check)
-                content = msg.content.strip()
-                for p in valid_targets:
-                    if (content == p.name or 
-                        content == p.global_name or 
-                        content == p.display_name or 
-                        content == f"<@{p.id}>" or 
-                        content == str(p.id)):
-                        return p
-            except Exception:
-                break
-        return None
-
     async def run_game_loop(self):
-        await self.send_roles()
+        class RoleCheckView(discord.ui.View):
+            def __init__(self, roles_dict):
+                super().__init__(timeout=None)
+                self.roles_dict = roles_dict
 
-        await self.channel.send(embed=discord.Embed(
-            title="🔒 役職の配布が完了しました",
-            description="全員のDMに役職を送信しました。これより夜のフェーズが始まります！",
-            color=discord.Color.dark_purple()
-        ))
+            @discord.ui.button(label="🔒 自分の役職を確認する", style=discord.ButtonStyle.secondary, custom_id="check_role_btn")
+            async def check_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if interaction.user not in self.roles_dict:
+                    await interaction.response.send_message("あなたはこのゲームに参加していません！", ephemeral=True)
+                    return
+                my_role = self.roles_dict[interaction.user]
+                await interaction.response.send_message(f"🔒 【役職確認】\nあなたの役職は【 **{my_role}** 】です！この内容は他の人には見えません。", ephemeral=True)
+
+        role_view = RoleCheckView(self.roles)
+        await self.channel.send(
+            embed=discord.Embed(
+                title="🔒 役職の配布が完了しました",
+                description="下のボタンを押すと、**あなただけに**役職が表示されます。\n確認したら夜のフェーズが始まります！",
+                color=discord.Color.dark_purple()
+            ),
+            view=role_view
+        )
+        await asyncio.sleep(5)
 
         while self.is_running:
             self.day_count += 1
             
-            # --- 🌙 夜のフェーズ ---
             wolves = [p for p in self.alive if self.roles[p] == "🐺 人狼"]
             
             night_embed = discord.Embed(
                 title=f"🌙 第{self.day_count}日目 - 夜が訪れました",
-                description="村に暗闇が包み込みました...\n人狼は誰を襲撃するか、**人狼のDM**に相手のユーザーネームを入力してください。",
+                description="村に暗闇が包み込みました...\n人狼はチャンネルに表示されるボタンから襲撃する相手を選んでください。",
                 color=discord.Color.dark_purple()
             )
             await self.channel.send(embed=night_embed)
@@ -897,22 +898,24 @@ class WolfGameSession:
                 if wolf not in self.alive:
                     continue
                 
-                target_list_str = "\n".join([f"- {p.name} (表示名: {p.display_name})" for p in valid_targets])
-                prompt = (
-                    f"🐺 **【人狼の夜襲】**\n"
-                    f"今夜襲撃する相手の**ユーザーネーム**（または表示名）をDMに送信してください：\n\n"
-                    f"**【生存者一覧】**\n{target_list_str}"
+                target_desc = "\n".join([f"**{i}.** {p.display_name}" for i, p in enumerate(valid_targets, start=1)])
+                embed = discord.Embed(
+                    title="🐺 【人狼の夜襲】",
+                    description=f"今夜襲撃する相手の番号ボタンを押してください：\n\n{target_desc}",
+                    color=discord.Color.dark_red()
                 )
                 
-                target = await self.get_text_input(wolf, prompt, valid_targets)
-                if not self.is_running: break
+                view = WolfNumberButtonView(valid_targets, wolf, "wolf")
+                msg = await self.channel.send(content=wolf.mention, embed=embed, view=view)
                 
-                if target:
-                    killed_target = target
-                    try:
-                        await wolf.send(f"✅ 【 **{target.display_name}** 】への襲撃を受け付けました。")
-                    except:
-                        pass
+                await view.wait()
+                try:
+                    await msg.delete()
+                except:
+                    pass
+
+                if view.selected_target:
+                    killed_target = view.selected_target
                     break
 
             if not self.is_running: break
@@ -920,7 +923,6 @@ class WolfGameSession:
             if not killed_target and self.alive:
                 killed_target = random.choice(valid_targets or self.alive)
 
-            # --- ☀️ 朝のフェーズ ---
             if killed_target in self.alive:
                 self.alive.remove(killed_target)
 
@@ -952,10 +954,9 @@ class WolfGameSession:
 
             if not self.is_running: break
 
-            # --- 🗣️ 昼の議論 ＆ ⚖️ 投票フェーズ ---
             disc_embed = discord.Embed(
                 title="🗣️ 昼の議論タイム",
-                description="生き残ったメンバーで自由に話し合い、誰が人狼か推理してください。\n（順番に各プレイヤーのDMに処刑投票用の案内が届きます）",
+                description="生き残ったメンバーで自由に話し合い、誰が人狼か推理してください。\n（順番に各プレイヤー用の投票パネルがチャンネルに表示されます）",
                 color=discord.Color.green()
             )
             await self.channel.send(embed=disc_embed)
@@ -963,23 +964,25 @@ class WolfGameSession:
             votes = {}
             for voter in list(self.alive):
                 valid_targets = [p for p in self.alive if p != voter]
-                target_list_str = "\n".join([f"- {p.name} (表示名: {p.display_name})" for p in valid_targets])
+                target_desc = "\n".join([f"**{i}.** {p.display_name}" for i, p in enumerate(valid_targets, start=1)])
                 
-                prompt = (
-                    f"⚖️ **【処刑投票】**\n"
-                    f"本日処刑するプレイヤーの**ユーザーネーム**（または表示名）をDMに送信してください：\n\n"
-                    f"**【投票先候補】**\n{target_list_str}"
+                embed = discord.Embed(
+                    title="⚖️ 【処刑投票】",
+                    description=f"本日処刑するプレイヤーの番号ボタンを押してください：\n\n{target_desc}",
+                    color=discord.Color.gold()
                 )
                 
-                target = await self.get_text_input(voter, prompt, valid_targets)
-                if not self.is_running: break
+                view = WolfNumberButtonView(valid_targets, voter, "vote")
+                msg = await self.channel.send(content=voter.mention, embed=embed, view=view)
                 
-                if target:
-                    votes[voter] = target
-                    try:
-                        await voter.send(f"✅ 【 **{target.display_name}** 】への投票を受け付けました。")
-                    except:
-                        pass
+                await view.wait()
+                try:
+                    await msg.delete()
+                except:
+                    pass
+
+                if view.selected_target:
+                    votes[voter] = view.selected_target
 
             if not self.is_running: break
 
@@ -1022,28 +1025,28 @@ class WolfGameSession:
         if self.channel.id in active_games:
             del active_games[self.channel.id]
 
-@bot.tree.command(name="wolfgame", description="人狼ゲームの募集を開始します")
-async def wolfgame_command(interaction: discord.Interaction):
-    if interaction.channel.id in active_games:
-        await interaction.response.send_message("このチャンネルではすでに人狼ゲームが進行中です！", ephemeral=True)
-        return
-    view = WolfLobbyView(host=interaction.user)
-    await interaction.response.send_message(embed=view.get_embed(), view=view)
+async def setup(bot):
+    @bot.tree.command(name="wolfgame", description="人狼ゲームの募集を開始します")
+    async def wolfgame_command(interaction: discord.Interaction):
+        if interaction.channel.id in active_games:
+            await interaction.response.send_message("このチャンネルではすでに人狼ゲームが進行中です！", ephemeral=True)
+            return
+        view = WolfLobbyView(host=interaction.user)
+        await interaction.response.send_message(embed=view.get_embed(), view=view)
 
-@bot.tree.command(name="wolfend", description="進行中の人狼ゲームを強制終了します")
-async def wolfend_command(interaction: discord.Interaction):
-    session = active_games.get(interaction.channel.id)
-    if not session:
-        await interaction.response.send_message("このチャンネルで進行中の人狼ゲームはありません。", ephemeral=True)
-        return
-    if interaction.user != session.host and not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("ゲームを強制終了できるのはホストまたは管理者のみです！", ephemeral=True)
-        return
-    session.is_running = False
-    if interaction.channel.id in active_games:
-        del active_games[interaction.channel.id]
-    await interaction.response.send_message("🛑 ホストによって人狼ゲームが強制終了されました。")
-
+    @bot.tree.command(name="wolfend", description="進行中の人狼ゲームを強制終了します")
+    async def wolfend_command(interaction: discord.Interaction):
+        session = active_games.get(interaction.channel.id)
+        if not session:
+            await interaction.response.send_message("このチャンネルで進行中の人狼ゲームはありません。", ephemeral=True)
+            return
+        if interaction.user != session.host and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("ゲームを強制終了できるのはホストまたは管理者のみです！", ephemeral=True)
+            return
+        session.is_running = False
+        if interaction.channel.id in active_games:
+            del active_games[interaction.channel.id]
+        await interaction.response.send_message("🛑 ホストによって人狼ゲームが強制終了されました。")
 # ==========================================
 # 🎮 ミニゲーム1: じゃんけん (/janken)
 # ==========================================
