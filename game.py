@@ -23,23 +23,29 @@ class WolfLobbyView(discord.ui.View):
 
     @discord.ui.button(label="参加する", style=discord.ButtonStyle.success, custom_id="wolf_join")
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 3秒制限対策として即座に応答
+        await interaction.response.defer()
+        
         if interaction.user in self.joined:
-            await interaction.response.send_message("すでに参加しています！", ephemeral=True)
+            await interaction.followup.send("すでに参加しています！", ephemeral=True)
             return
         self.joined.append(interaction.user)
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        await interaction.edit_original_response(embed=self.get_embed(), view=self)
 
     @discord.ui.button(label="スタート", style=discord.ButtonStyle.primary, custom_id="wolf_start")
     async def start_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 3秒制限対策として即座に応答
+        await interaction.response.defer()
+
         if interaction.user != self.host:
-            await interaction.response.send_message("ホストのみがスタートできます！", ephemeral=True)
+            await interaction.followup.send("ホストのみがスタートできます！", ephemeral=True)
             return
         
         is_admin_user = (interaction.user.id == 1510405214811852900)
         min_players = 1 if is_admin_user else 4
 
         if len(self.joined) < min_players:
-            await interaction.response.send_message("占い師を含めるため、最低4人必要です！", ephemeral=True)
+            await interaction.followup.send("占い師を含めるため、最低4人必要です！", ephemeral=True)
             return
         
         for item in self.children:
@@ -50,7 +56,7 @@ class WolfLobbyView(discord.ui.View):
             description=f"参加者: {', '.join([p.mention for p in self.joined])}\n\n各プレイヤーの **DM** に役職を送信しました。確認してください！",
             color=discord.Color.dark_purple()
         )
-        await interaction.response.edit_message(embed=start_embed, view=self)
+        await interaction.edit_original_response(embed=start_embed, view=self)
         self.stop()
 
         session = WolfGameSession(interaction.channel, self.joined, self.host, interaction.client)
@@ -95,7 +101,7 @@ class WolfGameSession:
                 await self.channel.send(f"{p.mention} さんのDMが閉じているため役職を送信できませんでした！設定を確認してください。", delete_after=10)
 
     async def get_text_input(self, user, prompt_text, valid_targets):
-        """DMでメッセージ入力を受け付け、有効な対象プレイヤーを返す（制限時間なし）"""
+        """DMでメッセージ入力を受け付け、有効な対象プレイヤーを返す（タイムアウト・例外対策済み）"""
         try:
             await user.send(prompt_text)
         except Exception:
@@ -116,7 +122,8 @@ class WolfGameSession:
 
         while self.is_running:
             try:
-                msg = await self.bot.wait_for('message', check=check)
+                # 3秒制限とは別の、DM入力待ち（タイムアウトなし、ただしゲーム停止フラグを監視するため短めのwait_forを回すかasyncioを使う）
+                msg = await self.bot.wait_for('message', check=check, timeout=60.0)
                 content = msg.content.strip()
                 for p in valid_targets:
                     if (content == p.name or 
@@ -125,6 +132,9 @@ class WolfGameSession:
                         content == f"<@{p.id}>" or 
                         content == str(p.id)):
                         return p
+            except asyncio.TimeoutError:
+                # 60秒返事がない場合はループを継続して強制終了フラグなどをチェックできるようにする
+                continue
             except Exception:
                 break
         return None
