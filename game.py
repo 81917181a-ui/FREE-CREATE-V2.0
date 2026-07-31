@@ -23,7 +23,6 @@ class WolfLobbyView(discord.ui.View):
 
     @discord.ui.button(label="参加する", style=discord.ButtonStyle.success, custom_id="wolf_join")
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 3秒制限対策として即座に応答
         await interaction.response.defer()
         
         if interaction.user in self.joined:
@@ -34,7 +33,6 @@ class WolfLobbyView(discord.ui.View):
 
     @discord.ui.button(label="スタート", style=discord.ButtonStyle.primary, custom_id="wolf_start")
     async def start_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 3秒制限対策として即座に応答
         await interaction.response.defer()
 
         if interaction.user != self.host:
@@ -122,7 +120,6 @@ class WolfGameSession:
 
         while self.is_running:
             try:
-                # 3秒制限とは別の、DM入力待ち（タイムアウトなし、ただしゲーム停止フラグを監視するため短めのwait_forを回すかasyncioを使う）
                 msg = await self.bot.wait_for('message', check=check, timeout=60.0)
                 content = msg.content.strip()
                 for p in valid_targets:
@@ -133,7 +130,6 @@ class WolfGameSession:
                         content == str(p.id)):
                         return p
             except asyncio.TimeoutError:
-                # 60秒返事がない場合はループを継続して強制終了フラグなどをチェックできるようにする
                 continue
             except Exception:
                 break
