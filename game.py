@@ -1,5 +1,5 @@
 # ==========================================
-# 🐺 人狼ゲーム システム（game.py用完全版）
+# 🐺 人狼ゲーム システム（game.py用完全版・3秒制限対策済み）
 # ==========================================
 
 import discord
@@ -329,26 +329,33 @@ class WolfGameSession:
         if self.channel.id in active_games:
             del active_games[self.channel.id]
 
-# cogとして組み込む場合のセットアップ関数
+# cogとして組み込む場合のセットアップ関数（3秒制限回避 defer対応）
 async def setup(bot):
     @bot.tree.command(name="wolfgame", description="人狼ゲームの募集を開始します")
     async def wolfgame_command(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=False)
+
         if interaction.channel.id in active_games:
-            await interaction.response.send_message("このチャンネルではすでに人狼ゲームが進行中です！", ephemeral=True)
+            await interaction.followup.send("このチャンネルではすでに人狼ゲームが進行中です！", ephemeral=True)
             return
+        
         view = WolfLobbyView(host=interaction.user)
-        await interaction.response.send_message(embed=view.get_embed(), view=view)
+        await interaction.followup.send(embed=view.get_embed(), view=view)
 
     @bot.tree.command(name="wolfend", description="進行中の人狼ゲームを強制終了します")
     async def wolfend_command(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=False)
+
         session = active_games.get(interaction.channel.id)
         if not session:
-            await interaction.response.send_message("このチャンネルで進行中の人狼ゲームはありません。", ephemeral=True)
+            await interaction.followup.send("このチャンネルで進行中の人狼ゲームはありません。", ephemeral=True)
             return
         if interaction.user != session.host and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("ゲームを強制終了できるのはホストまたは管理者のみです！", ephemeral=True)
+            await interaction.followup.send("ゲームを強制終了できるのはホストまたは管理者のみです！", ephemeral=True)
             return
+        
         session.is_running = False
         if interaction.channel.id in active_games:
             del active_games[interaction.channel.id]
-        await interaction.response.send_message("🛑 ホストによって人狼ゲームが強制終了されました。")
+        
+        await interaction.followup.send("🛑 ホストによって人狼ゲームが強制終了されました。")
