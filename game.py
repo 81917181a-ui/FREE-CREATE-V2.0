@@ -1,5 +1,5 @@
 # ==========================================
-# 🐺 人狼ゲーム システム（game.py用完全版・3秒制限対策済み）
+# 🐺 人狼ゲーム システム（game.py用完全版・ボタンエラー対策済み）
 # ==========================================
 
 import discord
@@ -23,28 +23,25 @@ class WolfLobbyView(discord.ui.View):
 
     @discord.ui.button(label="参加する", style=discord.ButtonStyle.success, custom_id="wolf_join")
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        
         if interaction.user in self.joined:
-            await interaction.followup.send("すでに参加しています！", ephemeral=True)
+            await interaction.response.send_message("すでに参加しています！", ephemeral=True)
             return
+        
         self.joined.append(interaction.user)
-        # defer後の編集には followup を使う
-        await interaction.followup.edit_message(message_id=interaction.message.id, embed=self.get_embed(), view=self)
+        # 応答を保留せず、直接メッセージを更新する
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
     @discord.ui.button(label="スタート", style=discord.ButtonStyle.primary, custom_id="wolf_start")
     async def start_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-
         if interaction.user != self.host:
-            await interaction.followup.send("ホストのみがスタートできます！", ephemeral=True)
+            await interaction.response.send_message("ホストのみがスタートできます！", ephemeral=True)
             return
         
         is_admin_user = (interaction.user.id == 1510405214811852900)
         min_players = 1 if is_admin_user else 4
 
         if len(self.joined) < min_players:
-            await interaction.followup.send("占い師を含めるため、最低4人必要です！", ephemeral=True)
+            await interaction.response.send_message("占い師を含めるため、最低4人必要です！", ephemeral=True)
             return
         
         for item in self.children:
@@ -55,8 +52,8 @@ class WolfLobbyView(discord.ui.View):
             description=f"参加者: {', '.join([p.mention for p in self.joined])}\n\n各プレイヤーの **DM** に役職を送信しました。確認してください！",
             color=discord.Color.dark_purple()
         )
-        # defer後の編集には followup を使う
-        await interaction.followup.edit_message(message_id=interaction.message.id, embed=start_embed, view=self)
+        
+        await interaction.response.edit_message(embed=start_embed, view=self)
         self.stop()
 
         session = WolfGameSession(interaction.channel, self.joined, self.host, interaction.client)
@@ -115,7 +112,7 @@ class WolfGameSession:
                     content == p.global_name or 
                     content == p.display_name or 
                     content == f"<@{p.id}>" or 
-                    content == str(p.id)):
+                    str(p.id) in content):
                     return True
             return False
 
@@ -128,7 +125,7 @@ class WolfGameSession:
                         content == p.global_name or 
                         content == p.display_name or 
                         content == f"<@{p.id}>" or 
-                        content == str(p.id)):
+                        str(p.id) in content):
                         return p
             except asyncio.TimeoutError:
                 continue
@@ -334,29 +331,26 @@ class WolfGameSession:
 async def setup(bot):
     @bot.tree.command(name="wolfgame", description="人狼ゲームの募集を開始します")
     async def wolfgame_command(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False)
-
         if interaction.channel.id in active_games:
-            await interaction.followup.send("このチャンネルではすでに人狼ゲームが進行中です！", ephemeral=True)
+            await interaction.response.send_message("このチャンネルではすでに人狼ゲームが進行中です！", ephemeral=True)
             return
         
         view = WolfLobbyView(host=interaction.user)
-        await interaction.followup.send(embed=view.get_embed(), view=view)
+        # コマンド実行時はすぐにレスポンスとしてembedを送信する
+        await interaction.response.send_message(embed=view.get_embed(), view=view)
 
     @bot.tree.command(name="wolfend", description="進行中の人狼ゲームを強制終了します")
     async def wolfend_command(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False)
-
         session = active_games.get(interaction.channel.id)
         if not session:
-            await interaction.followup.send("このチャンネルで進行中の人狼ゲームはありません。", ephemeral=True)
+            await interaction.response.send_message("このチャンネルで進行中の人狼ゲームはありません。", ephemeral=True)
             return
         if interaction.user != session.host and not interaction.user.guild_permissions.administrator:
-            await interaction.followup.send("ゲームを強制終了できるのはホストまたは管理者のみです！", ephemeral=True)
+            await interaction.response.send_message("ゲームを強制終了できるのはホストまたは管理者のみです！", ephemeral=True)
             return
         
         session.is_running = False
         if interaction.channel.id in active_games:
             del active_games[interaction.channel.id]
         
-        await interaction.followup.send("🛑 ホストによって人狼ゲームが強制終了されました。")
+        await interaction.response.send_message("🛑 ホストによって人狼ゲームが強制終了されました。")
