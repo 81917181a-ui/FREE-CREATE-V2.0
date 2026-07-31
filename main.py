@@ -9,17 +9,6 @@ from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
 
-import discord
-from discord.ext import commands
-from discord import app_commands
-import asyncio
-import psutil
-import os
-import time
-from datetime import datetime, timedelta
-from flask import Flask
-from threading import Thread
-
 # --- 👇 ここを追加・確認する ---
 intents = discord.Intents.default()
 intents.members = True          # サーバーメンバーの取得に必須
