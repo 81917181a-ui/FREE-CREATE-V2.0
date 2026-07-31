@@ -19,6 +19,16 @@ intents.dm_messages = True      # DMの送受信に必須
 bot = commands.Bot(command_prefix="!", intents=intents)
 # ------------------------------
 
+# （Webサーバー用などの既存コードがここに続く）
+
+# game.pyを読み込む処理（まだ書いていなければ追加）
+@bot.event
+async def on_ready():
+    await bot.load_extension("game") # game.pyを読み込む
+    await bot.tree.sync()
+    print(f"Logged in as {bot.user}")
+
+# bot.run("あなたのトークン") は一番下に記述
 # ==========================================
 # 🌐 Render ポート監視（Health Check）対策
 # ==========================================
