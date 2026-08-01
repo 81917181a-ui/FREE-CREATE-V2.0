@@ -8,7 +8,10 @@ import time
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
-from google import genai  # ←これを一番上に必ず入れてください！
+from openai import OpenAI
+import os
+
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # --- 👇 ここを追加・確認する ---
 intents = discord.Intents.default()
@@ -733,36 +736,45 @@ async def slot(interaction: discord.Interaction):
 # 🔍 検索コーナー（AI検索・wiki検索）
 # ==========================================
 
-# 5. Gemini検索 (/search)
-@bot.tree.command(name="search", description="Geminiを使って質問や検索をします")
+from openai import OpenAI
+import os
+
+# OpenAIクライアントの初期化
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# 5. ChatGPT検索 (/search)
+@bot.tree.command(name="search", description="ChatGPTを使って質問や検索をします")
 async def search(interaction: discord.Interaction, キーワード: str):
     await interaction.response.defer()
     
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=キーワード,
+        # OpenAI APIを使った回答の生成
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",  # コスパが良く高速なモデル
+            messages=[
+                {"role": "system", "content": "あなたは優秀なアシスタントです。簡潔でわかりやすく答えてください。"},
+                {"role": "user", "content": キーワード}
+            ]
         )
-        answer_text = response.text
+        answer_text = response.choices[0].message.content
         
         if len(answer_text) > 1900:
             answer_text = answer_text[:1900] + "...\n（文字数オーバーのため省略しました）"
 
         embed = discord.Embed(
-            title="🔍 AI検索結果",
+            title="🔍 AI検索結果 (ChatGPT)",
             description=f"**検索ワード:** {キーワード}\n\n{answer_text}",
-            color=discord.Color.blue()
+            color=discord.Color.green()
         )
         await interaction.followup.send(embed=embed)
         
     except Exception as e:
         embed = discord.Embed(
             title="🔍 AI検索エラー",
-            description=f"エラーが発生しました: `{e}`\n(APIキーを確認してください)",
+            description=f"エラーが発生しました: `{e}`\n(OpenAI APIキーを確認してください)",
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed)
-
 # ==========================================
 # 👑 管理者パネル & リスト表示
 # ==========================================
