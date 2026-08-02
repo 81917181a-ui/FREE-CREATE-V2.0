@@ -947,9 +947,18 @@ async def servers(ctx):
     embed.add_field(name="合計メンバー数", value=f"**{total_members:,}** 人", inline=False)
     
     await ctx.send(embed=embed)
-# !botinfo (通常コマンドに変更)
-@bot.command(name="botinfo")
-async def botinfo(ctx):
+
+# ==========================================
+# !freecreate グループコマンド (botinfo / restart)
+# ==========================================
+@bot.group(name="freecreate", invoke_without_command=True)
+async def freecreate(ctx):
+    # サブコマンドなしで !freecreate だけ実行された場合のメッセージ
+    await ctx.send("⚠️ 使用例: `!freecreate botinfo` または `!freecreate restart` を指定してください。")
+
+# !freecreate botinfo
+@freecreate.command(name="botinfo")
+async def freecreate_botinfo(ctx):
     uptime = datetime.now() - START_TIME
     hours, remainder = divmod(int(uptime.total_seconds()), 3600)
     minutes, _ = divmod(remainder, 60)
@@ -977,6 +986,20 @@ async def botinfo(ctx):
     
     await ctx.send(embed=embed)
 
+# !freecreate restart (管理者限定・Render再起動)
+@freecreate.command(name="restart")
+async def freecreate_restart(ctx):
+    # 管理者チェック
+    if ctx.author.id not in admin_users:
+        await ctx.send("⚠️ このコマンドを実行する権限がありません。")
+        return
+
+    await ctx.send("ボットを再起動しています... (Render側で自動再起動されます)")
+    
+    # Botの切断処理を行った後、プロセスを終了してRenderの自動再起動を誘発する
+    await bot.close()
+    os._exit(0)
+
 # 管理者用 コントロールパネル コマンド
 @bot.command(name="adminpanel")
 async def adminpanel(ctx):
@@ -984,7 +1007,6 @@ async def adminpanel(ctx):
         return
     embed = generate_admin_embed()
     await ctx.send(embed=embed, view=AdminPanelView())
-
     
 # Bot 起動時イベント
 @bot.event
