@@ -1,56 +1,84 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
 import asyncio
-import psutil
+from datetime import datetime, timedelta
 import os
 import time
-from datetime import datetime, timedelta
-from flask import Flask
 from threading import Thread
+import psutil
+from flask import Flask
 from openai import OpenAI
-import os
+import requests  # ★セルフ・ピン用に追加
+
+import discord
+from discord import app_commands
+from discord.ext import commands
 
 openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # --- 👇 ここを追加・確認する ---
 intents = discord.Intents.default()
-intents.members = True          # サーバーメンバーの取得に必須
+intents.members = (
+    True  # サーバーメンバーの取得に必須
+)
 intents.message_content = True  # メッセージ内容の取得に必須
-intents.dm_messages = True      # DMの送受信に必須
+intents.dm_messages = True  # DMの送受信に必須
 
 # 進行中の人狼ゲームを管理する辞書
-active_games = {} # {channel_id: WolfGameSession}
+active_games = {}  # {channel_id: WolfGameSession}
 
 # ボットの初期化（intents=intents を必ず渡してください）
 bot = commands.Bot(command_prefix="!", intents=intents)
 # ------------------------------
 
-# （Webサーバー用などの既存コードがここに続く）
 
 # game.pyを読み込む処理（まだ書いていなければ追加）
 @bot.event
 async def on_ready():
-    await bot.load_extension("game") # game.pyを読み込む
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user}")
+  await bot.load_extension("game")  # game.pyを読み込む
+  await bot.tree.sync()
+  print(f"Logged in as {bot.user}")
 
-# bot.run("あなたのトークン") は一番下に記述
+
 # ==========================================
-# 🌐 Render ポート監視（Health Check）対策
+# 🌐 Render ポート監視（Health Check）＆ セルフ・ピン対策
 # ==========================================
 app = Flask('')
 
+
 @app.route('/')
 def home():
-    return "Bot is alive!"
+  return 'Bot is alive!'
+
+
+# 自身を叩く用のヘルスチェックエンドポイント
+@app.route('/health')
+def health():
+  return 'OK', 200
+
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+  port = int(os.environ.get('PORT', 8080))
+  app.run(host='0.0.0.0', port=port)
 
-Thread(target=run_flask).start()
 
+# 10分ごとに自分自身を叩いてスリープを防ぐ関数
+def self_ping():
+  url = 'https://free-create-v2-0-ubpy.onrender.com/health'
+
+  while True:
+    try:
+      # 10分（600秒）待機してからアクセス
+      time.sleep(600)
+      response = requests.get(url)
+      print(f'Self-ping sent! Status: {response.status_code}')
+    except Exception as e:
+      print(f'Self-ping failed: {e}')
+
+
+# Flaskサーバーとセルフ・ピンをそれぞれバックグラウンドで起動
+Thread(target=run_flask, daemon=True).start()
+Thread(target=self_ping, daemon=True).start()
+
+# bot.run("あなたのトークン") は一番下に記述
 # ==========================================
 # 🤖 Discord Bot 基本設定
 # ==========================================
