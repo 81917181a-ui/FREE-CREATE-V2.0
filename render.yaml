@@ -1,7 +1,13 @@
 services:
-  - type: worker
+  - type: web
     name: free-create-dia-bot
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+    healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
