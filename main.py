@@ -1,18 +1,49 @@
 import asyncio
+import io
+import json
+import random  # おみくじ等で使用（元コードでは import が抜けていたため追加）
+import secrets
 from datetime import datetime, timedelta
 import os
 import time
 from threading import Thread
 import psutil
-from flask import Flask
-from openai import OpenAI
-import requests  # ★セルフ・ピン用に追加
+import requests  # セルフ・ピン / Gemini REST 呼び出し用
+
+import uvicorn
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import FileResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# ==========================================
+# 🔑 環境変数（Render に登録するのはこの2つだけ）
+#   DISCORD_BOT_TOKEN / GEMINI_API_KEY
+#   ※ PORT・RENDER_EXTERNAL_URL は Render が自動設定する
+# ==========================================
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-flash-latest"  # コード側で固定（環境変数を増やさない）
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://free-create-v2-0-ubpy.onrender.com").rstrip("/")
+PORT = int(os.environ.get("PORT", 8080))
+
+
+def gemini_generate(prompt: str, system: str = "", json_mode: bool = False, timeout: int = 25) -> str:
+  """Gemini REST を同期で呼ぶ（asyncio.to_thread 経由で使う）。"""
+  if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY が未設定です")
+  url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+  body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+  if system:
+    body["systemInstruction"] = {"parts": [{"text": system}]}
+  if json_mode:
+    body["generationConfig"] = {"responseMimeType": "application/json", "temperature": 0}
+  r = requests.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=timeout)
+  r.raise_for_status()
+  data = r.json()
+  return data["candidates"][0]["content"]["parts"][0]["text"]
 
 # --- 👇 ここを追加・確認する ---
 intents = discord.Intents.default()
@@ -41,28 +72,24 @@ async def on_ready():
 # ==========================================
 # 🌐 Render ポート監視（Health Check）＆ セルフ・ピン対策
 # ==========================================
-app = Flask('')
+#  Flask → FastAPI に置き換え（Bot と同じイベントループで動かし、Bot を直接参照できる）
+api = FastAPI(docs_url=None, redoc_url=None)
 
 
-@app.route('/')
+@api.get('/', response_class=PlainTextResponse)
 def home():
   return 'Bot is alive!'
 
 
 # 自身を叩く用のヘルスチェックエンドポイント
-@app.route('/health')
+@api.get('/health', response_class=PlainTextResponse)
 def health():
-  return 'OK', 200
-
-
-def run_flask():
-  port = int(os.environ.get('PORT', 8080))
-  app.run(host='0.0.0.0', port=port)
+  return 'OK'
 
 
 # 10分ごとに自分自身を叩いてスリープを防ぐ関数
 def self_ping():
-  url = 'https://free-create-v2-0-ubpy.onrender.com/health'
+  url = f'{BASE_URL}/health'
 
   while True:
     try:
@@ -74,15 +101,14 @@ def self_ping():
       print(f'Self-ping failed: {e}')
 
 
-# Flaskサーバーとセルフ・ピンをそれぞれバックグラウンドで起動
-Thread(target=run_flask, daemon=True).start()
+# セルフ・ピンはバックグラウンドスレッドで起動（Webサーバーは末尾で Bot と同時起動）
 Thread(target=self_ping, daemon=True).start()
 
 # bot.run("あなたのトークン") は一番下に記述
 # ==========================================
 # 🤖 Discord Bot 基本設定
 # ==========================================
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")  # 旧名も後方互換で許容
 OWNER_ID = 1301944996261400656
 
 intents = discord.Intents.default()
@@ -764,33 +790,23 @@ async def slot(interaction: discord.Interaction):
 # 🔍 検索コーナー（AI検索・wiki検索）
 # ==========================================
 
-from openai import OpenAI
-import os
-
-# OpenAIクライアントの初期化
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
-# 5. ChatGPT検索 (/search)
-@bot.tree.command(name="search", description="ChatGPTを使って質問や検索をします")
+# 5. AI検索 (/search)  ※ 環境変数を2つに絞るため OpenAI → Gemini に変更
+@bot.tree.command(name="search", description="AI(Gemini)を使って質問や検索をします")
 async def search(interaction: discord.Interaction, キーワード: str):
     await interaction.response.defer()
     
     try:
-        # OpenAI APIを使った回答の生成
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",  # コスパが良く高速なモデル
-            messages=[
-                {"role": "system", "content": "あなたは優秀なアシスタントです。簡潔でわかりやすく答えてください。"},
-                {"role": "user", "content": キーワード}
-            ]
+        answer_text = await asyncio.to_thread(
+            gemini_generate,
+            キーワード,
+            "あなたは優秀なアシスタントです。簡潔でわかりやすく答えてください。",
         )
-        answer_text = response.choices[0].message.content
         
         if len(answer_text) > 1900:
             answer_text = answer_text[:1900] + "...\n（文字数オーバーのため省略しました）"
 
         embed = discord.Embed(
-            title="🔍 AI検索結果 (ChatGPT)",
+            title="🔍 AI検索結果 (Gemini)",
             description=f"**検索ワード:** {キーワード}\n\n{answer_text}",
             color=discord.Color.green()
         )
@@ -799,7 +815,7 @@ async def search(interaction: discord.Interaction, キーワード: str):
     except Exception as e:
         embed = discord.Embed(
             title="🔍 AI検索エラー",
-            description=f"エラーが発生しました: `{e}`\n(OpenAI APIキーを確認してください)",
+            description=f"エラーが発生しました: `{e}`\n(GEMINI_API_KEY を確認してください)",
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed)
@@ -1014,6 +1030,331 @@ async def adminpanel(ctx):
     await ctx.send(embed=embed, view=AdminPanelView())
 
     
+# ==========================================
+# 🌐 Web連動 ダイヤ作成システム (/testing)
+#   フロー: /testing → 使い捨てURL発行 → Webフォーム入力
+#          → POST /api/submit は即応答 → BackgroundTasks で
+#            Gemini解析 + ダイヤ計算 + Discord送信
+# ==========================================
+TESTING_OWNER_ID = 1301944996261400656
+WEB_TOKEN_TTL = 1800  # 秒
+MAX_TRAINS = 3000
+web_tokens = {}  # {token: (user_id, expires_at)}
+
+DEFAULT_PARAMS = {
+    "dwell_seconds": 30,
+    "turnaround_minutes": 3,
+    "express_every": 0,
+    "express_name": "快速",
+    "local_name": "普通",
+    "summary": "備考なし（既定値を使用）",
+}
+
+
+def issue_web_token(user_id: int) -> str:
+    now = time.time()
+    for k, (_, exp) in list(web_tokens.items()):
+        if exp < now:
+            del web_tokens[k]
+    token = secrets.token_urlsafe(16)
+    web_tokens[token] = (user_id, now + WEB_TOKEN_TTL)
+    return token
+
+
+def verify_web_token(token: str) -> int:
+    v = web_tokens.get(token)
+    if not v or v[1] < time.time():
+        raise HTTPException(status_code=401, detail="リンクの有効期限切れです。/testing を再実行してください。")
+    return v[0]
+
+
+@bot.tree.command(name="testing", description="Web入力フォームでダイヤを作成します（管理者限定）")
+async def testing(interaction: discord.Interaction):
+    if interaction.user.id != TESTING_OWNER_ID:
+        await interaction.response.send_message("⚠️ このコマンドは使用できません。", ephemeral=True)
+        return
+    token = issue_web_token(interaction.user.id)
+    url = f"{BASE_URL}/form?t={token}"
+    await interaction.response.send_message(
+        f"入力フォームはこちらです（30分間有効・本人専用）:\n{url}", ephemeral=True
+    )
+
+
+# ---------- 共通サーバー / 共通チャンネル ----------
+async def _member_of(guild: discord.Guild, user_id: int):
+    try:
+        return guild.get_member(user_id) or await guild.fetch_member(user_id)
+    except discord.HTTPException:
+        return None
+
+
+def _both_can_send(channel, member, me) -> bool:
+    up, bp = channel.permissions_for(member), channel.permissions_for(me)
+    return (up.view_channel and up.send_messages
+            and bp.view_channel and bp.send_messages and bp.attach_files)
+
+
+async def get_shared_channels(user_id: int) -> list[dict]:
+    async def one(g: discord.Guild):
+        m = await _member_of(g, user_id)
+        if m is None or g.me is None:
+            return None
+        chs = [{"id": str(c.id), "name": c.name}
+               for c in g.text_channels if _both_can_send(c, m, g.me)]
+        return {"id": str(g.id), "name": g.name, "channels": chs} if chs else None
+
+    res = await asyncio.gather(*[one(g) for g in bot.guilds])
+    return [r for r in res if r]
+
+
+async def channel_allowed(user_id: int, channel_id: int) -> bool:
+    ch = bot.get_channel(channel_id)
+    if not isinstance(ch, discord.TextChannel):
+        return False
+    m = await _member_of(ch.guild, user_id)
+    return bool(m and ch.guild.me and _both_can_send(ch, m, ch.guild.me))
+
+
+# ---------- リクエストモデル ----------
+class StationIn(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    seconds: int = Field(ge=0, le=7200)  # 次駅までの所要時間（秒）。最終駅は無視
+
+
+class QuadIn(BaseModel):
+    start: str
+    end: str
+
+
+class DiagramRequest(BaseModel):
+    stations: list[StationIn] = Field(min_length=2, max_length=60)
+    key_stations: list[str] = []
+    start_time: str
+    end_time: str
+    trainsets: int = Field(ge=1, le=50)
+    remarks: str = Field("", max_length=1000)
+    passing_stations: list[str] = []
+    quad_sections: list[QuadIn] = []
+    target: str  # "dm" | "channel"
+    channel_id: str = ""
+
+
+def _to_sec(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    h, m = int(h), int(m)
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError
+    return h * 3600 + m * 60
+
+
+def _fmt(sec: int) -> str:
+    sec %= 86400
+    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
+
+
+# ---------- Gemini: 備考欄 → パラメータ ----------
+async def parse_remarks(remarks: str, names: list[str]) -> dict:
+    p = dict(DEFAULT_PARAMS)
+    if not remarks.strip() or not GEMINI_API_KEY:
+        return p
+    system = "あなたは鉄道ダイヤ設計の入力解析器です。指定のJSONのみを返してください。"
+    prompt = (
+        f"駅一覧: {', '.join(names)}\n"
+        f"備考: {remarks}\n\n"
+        "備考から次のキーを持つJSONを作成。不明な項目は既定値:\n"
+        '{"dwell_seconds": 停車時間秒(10-180, 既定30),'
+        ' "turnaround_minutes": 折返し分(1-10, 既定3),'
+        ' "express_every": 何往復に1本を速達にするか(0=速達なし, 既定0),'
+        ' "express_name": 速達の種別名(既定"快速"),'
+        ' "local_name": 各駅停車の種別名(既定"普通"),'
+        ' "summary": 解釈内容の日本語要約(80字以内)}'
+    )
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(gemini_generate, prompt, system, True), timeout=30
+        )
+        d = json.loads(raw)
+        if isinstance(d, list) and d:
+            d = d[0]
+        if not isinstance(d, dict):
+            raise ValueError("JSON形式が不正")
+        p["dwell_seconds"] = min(max(int(d.get("dwell_seconds", 30)), 10), 180)
+        p["turnaround_minutes"] = min(max(int(d.get("turnaround_minutes", 3)), 1), 10)
+        p["express_every"] = min(max(int(d.get("express_every", 0)), 0), 20)
+        p["express_name"] = str(d.get("express_name") or "快速")[:10]
+        p["local_name"] = str(d.get("local_name") or "普通")[:10]
+        p["summary"] = str(d.get("summary") or "備考を解析しました")[:120]
+    except Exception as e:
+        p["summary"] = f"備考の解析に失敗したため既定値を使用 ({type(e).__name__})"
+    return p
+
+
+# ---------- ダイヤ計算（純Python・軽量） ----------
+def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
+    names = [s.name for s in req.stations]
+    n = len(names)
+    idx = {nm: i for i, nm in enumerate(names)}
+    seg = [s.seconds for s in req.stations[:-1]]
+    dwell = params["dwell_seconds"]
+    turn = params["turnaround_minutes"] * 60
+    exp_n = params["express_every"]
+    key = set(req.key_stations) | {names[0], names[-1]}
+    N = req.trainsets
+
+    t0, t1 = _to_sec(req.start_time), _to_sec(req.end_time)
+    if t1 <= t0:
+        t1 += 86400  # 日またぎ
+
+    def run_trip(direction: int, dep: int, express: bool):
+        order = list(range(n)) if direction == 0 else list(range(n - 1, -1, -1))
+        rows, t = [], dep
+        for pos, i in enumerate(order):
+            if pos == 0:
+                rows.append((i, t, t, True))
+                continue
+            t += seg[min(order[pos - 1], i)]
+            if pos == n - 1:
+                rows.append((i, t, t, True))
+            elif (not express) or names[i] in key:
+                arr = t
+                t += dwell
+                rows.append((i, arr, t, True))
+            else:
+                rows.append((i, t, t, False))
+        return rows
+
+    one_way = sum(seg) + dwell * max(n - 2, 0)
+    cycle = 2 * (one_way + turn)
+
+    trains = []
+    for k in range(N):
+        t, direction, j = t0 + int(k * cycle / N), 0, 0
+        while t < t1 and len(trains) < MAX_TRAINS:
+            express = exp_n > 0 and ((j // 2) + k) % exp_n == 0
+            rows = run_trip(direction, t, express)
+            trains.append({"set": k + 1, "dir": direction, "express": express, "rows": rows})
+            t = rows[-1][1] + turn
+            direction ^= 1
+            j += 1
+    trains.sort(key=lambda x: x["rows"][0][1])
+
+    # 追い抜き簡易判定（速達が直前の各停に追いつく地点が待避駅/複々線か）
+    covered = {idx[s] for s in req.passing_stations if s in idx}
+    for q in req.quad_sections:
+        if q.start in idx and q.end in idx:
+            lo, hi = sorted((idx[q.start], idx[q.end]))
+            covered |= set(range(lo, hi + 1))
+    ok_cnt, warns = 0, []
+    for d in (0, 1):
+        ds = [x for x in trains if x["dir"] == d]
+        for ei, e in enumerate(ds):
+            if not e["express"]:
+                continue
+            loc = next((x for x in reversed(ds[:ei]) if not x["express"]), None)
+            if loc is None:
+                continue
+            ldep = {r[0]: r[2] for r in loc["rows"]}
+            for pos, r in enumerate(e["rows"][1:], start=1):
+                i = r[0]
+                if i in ldep and r[1] <= ldep[i]:
+                    prev_i = e["rows"][pos - 1][0]
+                    if i in covered or prev_i in covered:
+                        ok_cnt += 1
+                    else:
+                        warns.append(f"{_fmt(e['rows'][0][1])}発 {params['express_name']} が {names[prev_i]}〜{names[i]} で各停に追いつく")
+                    break
+
+    # テキスト出力
+    L = [
+        "【鉄道ダイヤ】",
+        f"運行時間 {req.start_time}〜{req.end_time} / 編成数 {N} / 停車{dwell}秒 / 折返し{params['turnaround_minutes']}分",
+        f"区間 {names[0]} - {names[-1]} / 主要駅 {', '.join(sorted(key, key=idx.get))}",
+        f"備考の解釈: {params['summary']}",
+        "",
+    ]
+    for no, tr in enumerate(trains, 1):
+        kind = params["express_name"] if tr["express"] else params["local_name"]
+        way = f"{names[0]}→{names[-1]}" if tr["dir"] == 0 else f"{names[-1]}→{names[0]}"
+        L.append(f"[{no:03d}] 編成{tr['set']} {way} {kind}")
+        for i, arr, dep, stop in tr["rows"]:
+            if not stop:
+                L.append(f"  {names[i]}: 通過 {_fmt(arr)}")
+            elif arr == dep:
+                L.append(f"  {names[i]}: {_fmt(arr)}")
+            else:
+                L.append(f"  {names[i]}: {_fmt(arr)}着 / {_fmt(dep)}発")
+        L.append("")
+
+    summary = (
+        f"ダイヤを作成しました。列車 {len(trains)} 本 / 編成 {N} / 追い抜き地点OK {ok_cnt} 件 / 要確認 {len(warns)} 件\n"
+        f"備考の解釈: {params['summary']}"
+    )
+    if len(trains) >= MAX_TRAINS:
+        summary += f"\n※ 上限 {MAX_TRAINS} 本で打ち切りました。"
+    if warns:
+        summary += "\n要確認(簡易判定):\n" + "\n".join(f"・{w}" for w in warns[:8])
+    return "\n".join(L), summary[:1900]
+
+
+# ---------- バックグラウンドジョブ ----------
+async def run_diagram_job(user_id: int, req: DiagramRequest):
+    try:
+        params = await parse_remarks(req.remarks, [s.name for s in req.stations])
+        text, summary = await asyncio.to_thread(build_diagram, req, params)
+        f = discord.File(io.BytesIO(text.encode("utf-8")), filename="diagram.txt")
+        if req.target == "dm":
+            user = await bot.fetch_user(user_id)
+            await user.send(summary, file=f)
+        else:
+            ch = bot.get_channel(int(req.channel_id)) or await bot.fetch_channel(int(req.channel_id))
+            await ch.send(summary, file=f)
+    except Exception as e:
+        print(f"diagram job failed: {e}")
+        try:
+            user = await bot.fetch_user(user_id)
+            await user.send(f"⚠️ ダイヤ作成に失敗しました: `{type(e).__name__}: {e}`"[:1900])
+        except Exception:
+            pass
+
+
+# ---------- Web API ----------
+@api.get("/form")
+def form_page(t: str = ""):
+    verify_web_token(t)
+    return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "form.html"))
+
+
+@api.get("/api/channels")
+async def api_channels(t: str = ""):
+    uid = verify_web_token(t)
+    return await get_shared_channels(uid)
+
+
+@api.post("/api/submit")
+async def api_submit(req: DiagramRequest, background: BackgroundTasks, t: str = ""):
+    uid = verify_web_token(t)
+    names = [s.name for s in req.stations]
+    if len(set(names)) != len(names):
+        raise HTTPException(400, "駅名が重複しています。")
+    known = set(names)
+    for nm in [*req.key_stations, *req.passing_stations,
+               *[q.start for q in req.quad_sections], *[q.end for q in req.quad_sections]]:
+        if nm not in known:
+            raise HTTPException(400, f"駅名リストにない駅が指定されています: {nm}")
+    try:
+        _to_sec(req.start_time)
+        _to_sec(req.end_time)
+    except ValueError:
+        raise HTTPException(400, "時刻は HH:MM 形式で入力してください。")
+    if req.target == "channel":
+        if not req.channel_id.isdigit() or not await channel_allowed(uid, int(req.channel_id)):
+            raise HTTPException(400, "選択したチャンネルには送信できません。")
+    elif req.target != "dm":
+        raise HTTPException(400, "出力先が不正です。")
+    background.add_task(run_diagram_job, uid, req)  # 即応答・処理は裏で実行
+    return {"ok": True, "message": "受け付けました。完了するとDiscordに届きます。"}
+
+
 # Bot 起動時イベント
 @bot.event
 async def on_ready():
@@ -1024,4 +1365,15 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
-bot.run(TOKEN)
+
+# ==========================================
+# 🚀 起動: Webサーバー(FastAPI/uvicorn)と Bot を同一イベントループで同時実行
+# ==========================================
+async def main():
+    server = uvicorn.Server(uvicorn.Config(api, host="0.0.0.0", port=PORT, log_level="warning"))
+    async with bot:
+        await asyncio.gather(server.serve(), bot.start(TOKEN))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
