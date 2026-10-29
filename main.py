@@ -1321,7 +1321,12 @@ async def run_diagram_job(user_id: int, req: DiagramRequest):
 @api.get("/form")
 def form_page(t: str = ""):
     verify_web_token(t)
-    return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "form.html"))
+    base = os.path.dirname(os.path.abspath(__file__))
+    # web/form.html を優先し、ルート直下の form.html でも動くようにする
+    for p in (os.path.join(base, "web", "form.html"), os.path.join(base, "form.html")):
+        if os.path.isfile(p):
+            return FileResponse(p, media_type="text/html")
+    raise HTTPException(500, "form.html が見つかりません。リポジトリに web/form.html を追加してデプロイしてください。")
 
 
 @api.get("/api/channels")
