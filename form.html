@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ダイヤ作成フォーム</title>
+<style>
+  body { font-family: sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; color: #111; }
+  h1 { font-size: 20px; border-bottom: 2px solid #111; padding-bottom: 6px; }
+  fieldset { border: 1px solid #111; margin: 16px 0; padding: 12px; }
+  legend { font-weight: bold; padding: 0 6px; }
+  .row { display: flex; gap: 8px; margin: 6px 0; align-items: center; flex-wrap: wrap; }
+  input, select, textarea, button { font-size: 14px; padding: 6px; border: 1px solid #111; background: #fff; border-radius: 0; }
+  button { cursor: pointer; background: #111; color: #fff; }
+  button.sub { background: #fff; color: #111; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 80px; }
+  .tag { display: inline-block; border: 1px solid #111; padding: 2px 6px; margin: 2px; }
+  .tag button { padding: 0 4px; margin-left: 4px; }
+  label.chk { display: inline-block; margin: 2px 10px 2px 0; }
+  #status { margin-top: 12px; font-weight: bold; white-space: pre-wrap; }
+  .hint { color: #555; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>鉄道ダイヤ作成</h1>
+
+<fieldset>
+  <legend>駅と所要時間</legend>
+  <div class="hint">所要時間は「次の駅まで」の秒数です。最終駅の値は使用されません。</div>
+  <div id="stations"></div>
+  <button type="button" class="sub" id="addStation">追加する</button>
+</fieldset>
+
+<fieldset>
+  <legend>主要駅</legend>
+  <div class="row">
+    <select id="keySel"></select>
+    <button type="button" id="addKey">追加する</button>
+  </div>
+  <div id="keyList"></div>
+</fieldset>
+
+<fieldset>
+  <legend>運行時間・条件</legend>
+  <div class="row">
+    <label>開始時間 <input type="time" id="startTime" value="06:00"></label>
+    <label>終了時間 <input type="time" id="endTime" value="23:00"></label>
+    <label>編成数 <input type="number" id="trainsets" value="4" min="1" max="50" style="width:70px"></label>
+  </div>
+  <div>備考（自由記述）</div>
+  <textarea id="remarks" placeholder="例: 停車時間は40秒、折返しは5分、快速を2往復に1本走らせる"></textarea>
+</fieldset>
+
+<fieldset>
+  <legend>退避可能駅</legend>
+  <div id="passList" class="hint">駅名を入力すると選択肢が表示されます。</div>
+</fieldset>
+
+<fieldset>
+  <legend>複々線区間</legend>
+  <div class="row">
+    <select id="quadFrom"></select>
+    <span>から</span>
+    <select id="quadTo"></select>
+    <button type="button" id="addQuad">追加する</button>
+  </div>
+  <div id="quadList"></div>
+</fieldset>
+
+<fieldset>
+  <legend>出力先</legend>
+  <div class="row">
+    <label><input type="radio" name="target" value="dm" checked> DM</label>
+    <label><input type="radio" name="target" value="channel"> サーバーのチャンネル</label>
+  </div>
+  <div class="row">
+    <select id="channelSel" disabled><option value="">読み込み中</option></select>
+  </div>
+</fieldset>
+
+<button type="button" id="submit">出力</button>
+<div id="status"></div>
+
+<script>
+const T = new URLSearchParams(location.search).get("t") || "";
+const $ = (id) => document.getElementById(id);
+let keys = [];
+let quads = [];
+let passChecked = new Set();
+
+function stationNames() {
+  return [...document.querySelectorAll("#stations .st-name")].map(e => e.value.trim()).filter(Boolean);
+}
+
+function addStationRow(name = "", sec = "") {
+  const d = document.createElement("div");
+  d.className = "row";
+  d.innerHTML = '<input class="st-name" placeholder="駅名" size="14">' +
+    '<input class="st-sec" type="number" min="0" placeholder="所要時間(秒)" style="width:120px">' +
+    '<button type="button" class="sub rm">削除</button>';
+  d.querySelector(".st-name").value = name;
+  d.querySelector(".st-sec").value = sec;
+  d.querySelector(".st-name").addEventListener("input", refresh);
+  d.querySelector(".rm").addEventListener("click", () => { d.remove(); refresh(); });
+  $("stations").appendChild(d);
+}
+
+function fillSelect(sel, names) {
+  const cur = sel.value;
+  sel.innerHTML = "";
+  names.forEach(n => { const o = document.createElement("option"); o.value = o.textContent = n; sel.appendChild(o); });
+  if (names.includes(cur)) sel.value = cur;
+}
+
+function renderTags(box, items, onRemove, label) {
+  box.innerHTML = "";
+  items.forEach((it, i) => {
+    const s = document.createElement("span");
+    s.className = "tag";
+    s.textContent = label(it);
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "sub"; b.textContent = "x";
+    b.addEventListener("click", () => onRemove(i));
+    s.appendChild(b);
+    box.appendChild(s);
+  });
+}
+
+function refresh() {
+  const names = stationNames();
+  keys = keys.filter(k => names.includes(k));
+  quads = quads.filter(q => names.includes(q.start) && names.includes(q.end));
+  fillSelect($("keySel"), names);
+  fillSelect($("quadFrom"), names);
+  fillSelect($("quadTo"), names);
+  renderTags($("keyList"), keys, i => { keys.splice(i, 1); refresh(); }, k => k);
+  renderTags($("quadList"), quads, i => { quads.splice(i, 1); refresh(); }, q => q.start + " - " + q.end);
+  // 退避可能駅: 駅名リストにリアルタイム連動（チェック状態は保持）
+  const box = $("passList");
+  document.querySelectorAll("#passList input:checked").forEach(c => passChecked.add(c.value));
+  box.innerHTML = "";
+  if (!names.length) { box.textContent = "駅名を入力すると選択肢が表示されます。"; return; }
+  names.forEach(n => {
+    const l = document.createElement("label");
+    l.className = "chk";
+    const c = document.createElement("input");
+    c.type = "checkbox"; c.value = n; c.checked = passChecked.has(n);
+    c.addEventListener("change", () => { c.checked ? passChecked.add(n) : passChecked.delete(n); });
+    l.appendChild(c); l.appendChild(document.createTextNode(" " + n));
+    box.appendChild(l);
+  });
+}
+
+$("addStation").onclick = () => addStationRow();
+$("addKey").onclick = () => { const v = $("keySel").value; if (v && !keys.includes(v)) { keys.push(v); refresh(); } };
+$("addQuad").onclick = () => {
+  const a = $("quadFrom").value, b = $("quadTo").value;
+  if (a && b && a !== b) { quads.push({ start: a, end: b }); refresh(); }
+};
+document.querySelectorAll('input[name="target"]').forEach(r => r.addEventListener("change", () => {
+  $("channelSel").disabled = document.querySelector('input[name="target"]:checked').value !== "channel";
+}));
+
+async function loadChannels() {
+  try {
+    const r = await fetch("/api/channels?t=" + encodeURIComponent(T));
+    if (!r.ok) throw new Error((await r.json()).detail || r.status);
+    const data = await r.json();
+    const sel = $("channelSel");
+    sel.innerHTML = "";
+    if (!data.length) { sel.innerHTML = '<option value="">送信可能なチャンネルがありません</option>'; return; }
+    data.forEach(g => {
+      const og = document.createElement("optgroup");
+      og.label = g.name;
+      g.channels.forEach(c => { const o = document.createElement("option"); o.value = c.id; o.textContent = "#" + c.name; og.appendChild(o); });
+      sel.appendChild(og);
+    });
+  } catch (e) {
+    $("channelSel").innerHTML = '<option value="">取得失敗</option>';
+    $("status").textContent = "チャンネル取得に失敗しました: " + e.message;
+  }
+}
+
+$("submit").onclick = async () => {
+  const rows = [...document.querySelectorAll("#stations .row")].map(r => ({
+    name: r.querySelector(".st-name").value.trim(),
+    seconds: parseInt(r.querySelector(".st-sec").value || "0", 10)
+  })).filter(r => r.name);
+  if (rows.length < 2) { $("status").textContent = "駅は2つ以上入力してください。"; return; }
+  const target = document.querySelector('input[name="target"]:checked').value;
+  const body = {
+    stations: rows,
+    key_stations: keys,
+    start_time: $("startTime").value,
+    end_time: $("endTime").value,
+    trainsets: parseInt($("trainsets").value || "1", 10),
+    remarks: $("remarks").value,
+    passing_stations: [...passChecked].filter(n => rows.some(r => r.name === n)),
+    quad_sections: quads,
+    target: target,
+    channel_id: target === "channel" ? $("channelSel").value : ""
+  };
+  $("submit").disabled = true;
+  $("status").textContent = "送信中";
+  try {
+    const r = await fetch("/api/submit?t=" + encodeURIComponent(T), {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "入力内容を確認してください");
+    $("status").textContent = j.message;
+  } catch (e) {
+    $("status").textContent = "エラー: " + e.message;
+  } finally {
+    $("submit").disabled = false;
+  }
+};
+
+addStationRow(); addStationRow();
+refresh();
+loadChannels();
+</script>
+</body>
+</html>
