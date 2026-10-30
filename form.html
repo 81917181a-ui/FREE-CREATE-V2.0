@@ -80,8 +80,12 @@
     <label><input type="radio" name="target" value="channel"> サーバーのチャンネル</label>
   </div>
   <div class="row">
-    <select id="channelSel" disabled><option value="">読み込み中</option></select>
+    <label>サーバー <select id="serverSel" disabled><option value="">読み込み中</option></select></label>
   </div>
+  <div class="row">
+    <label>チャンネル <select id="channelSel" disabled><option value="">サーバーを選択してください</option></select></label>
+  </div>
+  <div class="hint">あなたとBOTの両方が参加していて、両方が閲覧・送信できるチャンネルのみ表示されます。</div>
 </fieldset>
 
 <button type="button" id="submit">出力</button>
@@ -239,27 +243,44 @@ $("addSp").onclick = () => {
   specials.push({ start: list[0] || "", end: list[list.length - 1] || "", kind: "" });
   refresh();
 };
-document.querySelectorAll('input[name="target"]').forEach(r => r.addEventListener("change", () => {
-  $("channelSel").disabled = document.querySelector('input[name="target"]:checked').value !== "channel";
-}));
+let guilds = [];   // [{id, name, channels:[{id, name}]}]  ボットとユーザー双方が居るサーバーのみ
+
+function applyTargetState() {
+  const on = document.querySelector('input[name="target"]:checked').value === "channel";
+  $("serverSel").disabled = !on || !guilds.length;
+  $("channelSel").disabled = !on || !$("channelSel").options.length || !$("channelSel").value;
+}
+document.querySelectorAll('input[name="target"]').forEach(r => r.addEventListener("change", applyTargetState));
+
+function fillChannels() {
+  const g = guilds.find(x => x.id === $("serverSel").value);
+  const sel = $("channelSel");
+  sel.innerHTML = "";
+  if (!g || !g.channels.length) { sel.innerHTML = '<option value="">送信可能なチャンネルがありません</option>'; }
+  else g.channels.forEach(c => { const o = document.createElement("option"); o.value = c.id; o.textContent = "#" + c.name; sel.appendChild(o); });
+  applyTargetState();
+}
+$("serverSel").addEventListener("change", fillChannels);
 
 async function loadChannels() {
   try {
     const r = await fetch("/api/channels?t=" + encodeURIComponent(T));
     if (!r.ok) throw new Error((await r.json()).detail || r.status);
-    const data = await r.json();
-    const sel = $("channelSel");
-    sel.innerHTML = "";
-    if (!data.length) { sel.innerHTML = '<option value="">送信可能なチャンネルがありません</option>'; return; }
-    data.forEach(g => {
-      const og = document.createElement("optgroup");
-      og.label = g.name;
-      g.channels.forEach(c => { const o = document.createElement("option"); o.value = c.id; o.textContent = "#" + c.name; og.appendChild(o); });
-      sel.appendChild(og);
-    });
+    guilds = await r.json();
+    const ss = $("serverSel");
+    ss.innerHTML = "";
+    if (!guilds.length) {
+      ss.innerHTML = '<option value="">共通のサーバーがありません</option>';
+      $("channelSel").innerHTML = '<option value="">-</option>';
+      applyTargetState();
+      return;
+    }
+    guilds.forEach(g => { const o = document.createElement("option"); o.value = g.id; o.textContent = g.name; ss.appendChild(o); });
+    fillChannels();
   } catch (e) {
+    $("serverSel").innerHTML = '<option value="">取得失敗</option>';
     $("channelSel").innerHTML = '<option value="">取得失敗</option>';
-    $("status").textContent = "チャンネル取得に失敗しました: " + e.message;
+    $("status").textContent = "サーバー一覧の取得に失敗しました: " + e.message;
   }
 }
 
@@ -268,6 +289,7 @@ $("submit").onclick = async () => {
   const rows = sts.map(s => ({ name: s.name.trim(), seconds: parseInt(s.sec || "0", 10) || 0 }));
   if (rows.length < 2) { $("status").textContent = "駅は2つ以上入力してください。"; return; }
   const target = document.querySelector('input[name="target"]:checked').value;
+  if (target === "channel" && !$("channelSel").value) { $("status").textContent = "サーバーとチャンネルを選択してください。"; return; }
   // 単線 / 複々線 が選ばれた区間だけ送る（未選択は複線扱いなので送らない）
   const quad = specials.filter(s => s.kind && s.start && s.end && s.start !== s.end)
                        .map(s => ({ start: s.start, end: s.end, kind: s.kind }));
