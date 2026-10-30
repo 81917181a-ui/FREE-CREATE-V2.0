@@ -19,6 +19,16 @@
   label.chk { display: inline-block; margin: 2px 10px 2px 0; }
   #status { margin-top: 12px; font-weight: bold; white-space: pre-wrap; }
   .hint { color: #555; font-size: 12px; }
+  /* 駅と所要時間: 縦並び */
+  .stcol { display: flex; flex-direction: column; gap: 0; max-width: 360px; }
+  .st-box { display: flex; gap: 8px; margin: 0; }
+  .st-box input { flex: 1; min-width: 0; }
+  .gap-box { display: flex; align-items: center; gap: 8px; margin: 0; padding: 4px 0 4px 16px; border-left: 3px solid #111; margin-left: 12px; }
+  .gap-box input { width: 120px; }
+  .gap-box span { color: #555; font-size: 12px; }
+  /* 特殊区間 */
+  .sp-item { border: 1px solid #111; padding: 8px; margin: 8px 0; }
+  .sp-item select { min-width: 100px; }
 </style>
 </head>
 <body>
@@ -26,9 +36,9 @@
 
 <fieldset>
   <legend>駅と所要時間</legend>
-  <div class="hint">所要時間は「次の駅まで」の秒数です。最終駅の値は使用されません。</div>
-  <div id="stations"></div>
-  <button type="button" class="sub" id="addStation">追加する</button>
+  <div class="hint">駅名の間の欄に、その2駅間の所要時間(秒)を入力します。</div>
+  <div id="stations" class="stcol"></div>
+  <div class="row"><button type="button" class="sub" id="addStation">追加する</button></div>
 </fieldset>
 
 <fieldset>
@@ -57,14 +67,10 @@
 </fieldset>
 
 <fieldset>
-  <legend>複々線区間</legend>
-  <div class="row">
-    <select id="quadFrom"></select>
-    <span>から</span>
-    <select id="quadTo"></select>
-    <button type="button" id="addQuad">追加する</button>
-  </div>
-  <div id="quadList"></div>
+  <legend>特殊区間</legend>
+  <div class="hint">ここに載せていない区間は複線として扱います。</div>
+  <div id="spList"></div>
+  <div class="row"><button type="button" class="sub" id="addSp">追加する</button></div>
 </fieldset>
 
 <fieldset>
@@ -84,32 +90,67 @@
 <script>
 const T = new URLSearchParams(location.search).get("t") || "";
 const $ = (id) => document.getElementById(id);
+
+// ---- 状態 ----
+// sts[i].sec は「駅i から 駅i+1 までの所要時間(秒)」。最終駅の sec は使わない。
+let sts = [{ name: "", sec: "" }, { name: "", sec: "" }];
 let keys = [];
-let quads = [];
+let specials = [];            // { start, end, kind: "single" | "quad" | "" }
 let passChecked = new Set();
 
-function stationNames() {
-  return [...document.querySelectorAll("#stations .st-name")].map(e => e.value.trim()).filter(Boolean);
+function names() { return sts.map(s => s.name.trim()).filter(Boolean); }
+
+// ---- 駅と所要時間（縦並び） ----
+function renderStations() {
+  const box = $("stations");
+  box.innerHTML = "";
+  sts.forEach((s, i) => {
+    const row = document.createElement("div");
+    row.className = "st-box";
+    const inp = document.createElement("input");
+    inp.placeholder = "駅名";
+    inp.value = s.name;
+    inp.addEventListener("input", () => { s.name = inp.value; updateGapHints(); refresh(); });
+    row.appendChild(inp);
+    const rm = document.createElement("button");
+    rm.type = "button"; rm.className = "sub"; rm.textContent = "削除";
+    rm.addEventListener("click", () => {
+      if (sts.length <= 2) return;
+      sts.splice(i, 1);
+      renderStations(); refresh();
+    });
+    row.appendChild(rm);
+    box.appendChild(row);
+
+    if (i < sts.length - 1) {
+      const g = document.createElement("div");
+      g.className = "gap-box";
+      const sec = document.createElement("input");
+      sec.type = "number"; sec.min = "0"; sec.placeholder = "所要時間(秒)";
+      sec.value = s.sec;
+      sec.addEventListener("input", () => { s.sec = sec.value; });
+      const hint = document.createElement("span");
+      hint.className = "gap-hint";
+      g.appendChild(sec); g.appendChild(hint);
+      box.appendChild(g);
+    }
+  });
+  updateGapHints();
 }
 
-function addStationRow(name = "", sec = "") {
-  const d = document.createElement("div");
-  d.className = "row";
-  d.innerHTML = '<input class="st-name" placeholder="駅名" size="14">' +
-    '<input class="st-sec" type="number" min="0" placeholder="所要時間(秒)" style="width:120px">' +
-    '<button type="button" class="sub rm">削除</button>';
-  d.querySelector(".st-name").value = name;
-  d.querySelector(".st-sec").value = sec;
-  d.querySelector(".st-name").addEventListener("input", refresh);
-  d.querySelector(".rm").addEventListener("click", () => { d.remove(); refresh(); });
-  $("stations").appendChild(d);
+function updateGapHints() {
+  document.querySelectorAll("#stations .gap-hint").forEach((h, i) => {
+    const a = (sts[i] && sts[i].name.trim()) || "?";
+    const b = (sts[i + 1] && sts[i + 1].name.trim()) || "?";
+    h.textContent = a + " - " + b;
+  });
 }
 
-function fillSelect(sel, names) {
-  const cur = sel.value;
+// ---- 共通 ----
+function fillSelect(sel, list, value) {
   sel.innerHTML = "";
-  names.forEach(n => { const o = document.createElement("option"); o.value = o.textContent = n; sel.appendChild(o); });
-  if (names.includes(cur)) sel.value = cur;
+  list.forEach(n => { const o = document.createElement("option"); o.value = o.textContent = n; sel.appendChild(o); });
+  if (list.includes(value)) sel.value = value;
 }
 
 function renderTags(box, items, onRemove, label) {
@@ -126,21 +167,61 @@ function renderTags(box, items, onRemove, label) {
   });
 }
 
+// ---- 特殊区間 ----
+function renderSpecials(list) {
+  const box = $("spList");
+  box.innerHTML = "";
+  specials.forEach((sp, i) => {
+    if (!list.includes(sp.start)) sp.start = list[0] || "";
+    if (!list.includes(sp.end)) sp.end = list[list.length - 1] || "";
+    const item = document.createElement("div");
+    item.className = "sp-item";
+
+    const r1 = document.createElement("div");
+    r1.className = "row";
+    const s1 = document.createElement("select");
+    const s2 = document.createElement("select");
+    fillSelect(s1, list, sp.start); fillSelect(s2, list, sp.end);
+    s1.addEventListener("change", () => { sp.start = s1.value; });
+    s2.addEventListener("change", () => { sp.end = s2.value; });
+    const sep = document.createElement("span"); sep.textContent = "〜";
+    const rm = document.createElement("button");
+    rm.type = "button"; rm.className = "sub"; rm.textContent = "削除";
+    rm.addEventListener("click", () => { specials.splice(i, 1); refresh(); });
+    r1.appendChild(s1); r1.appendChild(sep); r1.appendChild(s2); r1.appendChild(rm);
+
+    const r2 = document.createElement("div");
+    r2.className = "row";
+    [["single", "単線"], ["quad", "複々線"]].forEach(([k, label]) => {
+      const l = document.createElement("label");
+      const c = document.createElement("input");
+      c.type = "checkbox"; c.checked = sp.kind === k;
+      c.addEventListener("change", () => {
+        sp.kind = c.checked ? k : "";
+        r2.querySelectorAll("input").forEach(o => { if (o !== c) o.checked = false; }); // どちらか一方のみ
+      });
+      l.appendChild(c); l.appendChild(document.createTextNode(" " + label));
+      r2.appendChild(l);
+    });
+
+    item.appendChild(r1); item.appendChild(r2);
+    box.appendChild(item);
+  });
+}
+
+// ---- 駅名に連動して全体を更新 ----
 function refresh() {
-  const names = stationNames();
-  keys = keys.filter(k => names.includes(k));
-  quads = quads.filter(q => names.includes(q.start) && names.includes(q.end));
-  fillSelect($("keySel"), names);
-  fillSelect($("quadFrom"), names);
-  fillSelect($("quadTo"), names);
+  const list = names();
+  keys = keys.filter(k => list.includes(k));
+  fillSelect($("keySel"), list, $("keySel").value);
   renderTags($("keyList"), keys, i => { keys.splice(i, 1); refresh(); }, k => k);
-  renderTags($("quadList"), quads, i => { quads.splice(i, 1); refresh(); }, q => q.start + " - " + q.end);
-  // 退避可能駅: 駅名リストにリアルタイム連動（チェック状態は保持）
+  renderSpecials(list);
+
   const box = $("passList");
   document.querySelectorAll("#passList input:checked").forEach(c => passChecked.add(c.value));
   box.innerHTML = "";
-  if (!names.length) { box.textContent = "駅名を入力すると選択肢が表示されます。"; return; }
-  names.forEach(n => {
+  if (!list.length) { box.textContent = "駅名を入力すると選択肢が表示されます。"; return; }
+  list.forEach(n => {
     const l = document.createElement("label");
     l.className = "chk";
     const c = document.createElement("input");
@@ -151,11 +232,12 @@ function refresh() {
   });
 }
 
-$("addStation").onclick = () => addStationRow();
+$("addStation").onclick = () => { sts.push({ name: "", sec: "" }); renderStations(); refresh(); };
 $("addKey").onclick = () => { const v = $("keySel").value; if (v && !keys.includes(v)) { keys.push(v); refresh(); } };
-$("addQuad").onclick = () => {
-  const a = $("quadFrom").value, b = $("quadTo").value;
-  if (a && b && a !== b) { quads.push({ start: a, end: b }); refresh(); }
+$("addSp").onclick = () => {
+  const list = names();
+  specials.push({ start: list[0] || "", end: list[list.length - 1] || "", kind: "" });
+  refresh();
 };
 document.querySelectorAll('input[name="target"]').forEach(r => r.addEventListener("change", () => {
   $("channelSel").disabled = document.querySelector('input[name="target"]:checked').value !== "channel";
@@ -182,12 +264,13 @@ async function loadChannels() {
 }
 
 $("submit").onclick = async () => {
-  const rows = [...document.querySelectorAll("#stations .row")].map(r => ({
-    name: r.querySelector(".st-name").value.trim(),
-    seconds: parseInt(r.querySelector(".st-sec").value || "0", 10)
-  })).filter(r => r.name);
+  if (sts.some(s => !s.name.trim())) { $("status").textContent = "駅名が空の欄があります。入力するか削除してください。"; return; }
+  const rows = sts.map(s => ({ name: s.name.trim(), seconds: parseInt(s.sec || "0", 10) || 0 }));
   if (rows.length < 2) { $("status").textContent = "駅は2つ以上入力してください。"; return; }
   const target = document.querySelector('input[name="target"]:checked').value;
+  // 単線 / 複々線 が選ばれた区間だけ送る（未選択は複線扱いなので送らない）
+  const quad = specials.filter(s => s.kind && s.start && s.end && s.start !== s.end)
+                       .map(s => ({ start: s.start, end: s.end, kind: s.kind }));
   const body = {
     stations: rows,
     key_stations: keys,
@@ -196,7 +279,7 @@ $("submit").onclick = async () => {
     trainsets: parseInt($("trainsets").value || "1", 10),
     remarks: $("remarks").value,
     passing_stations: [...passChecked].filter(n => rows.some(r => r.name === n)),
-    quad_sections: quads,
+    quad_sections: quad,
     target: target,
     channel_id: target === "channel" ? $("channelSel").value : ""
   };
@@ -216,7 +299,7 @@ $("submit").onclick = async () => {
   }
 };
 
-addStationRow(); addStationRow();
+renderStations();
 refresh();
 loadChannels();
 </script>
