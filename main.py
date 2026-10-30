@@ -1122,8 +1122,10 @@ class StationIn(BaseModel):
 
 
 class QuadIn(BaseModel):
+    """特殊区間。kind: "quad"=複々線 / "single"=単線（未指定の区間は複線扱い）"""
     start: str
     end: str
+    kind: str = "quad"
 
 
 class DiagramRequest(BaseModel):
@@ -1240,11 +1242,31 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
 
     # 追い抜き簡易判定（速達が直前の各停に追いつく地点が待避駅/複々線か）
     covered = {idx[s] for s in req.passing_stations if s in idx}
+    singles = []
     for q in req.quad_sections:
         if q.start in idx and q.end in idx:
             lo, hi = sorted((idx[q.start], idx[q.end]))
-            covered |= set(range(lo, hi + 1))
+            if q.kind == "single":
+                singles.append((lo, hi))
+            else:
+                covered |= set(range(lo, hi + 1))
     ok_cnt, warns = 0, []
+
+    # 単線区間: 上下列車が同時に区間内に居る場合を要確認として報告（簡易判定）
+    for lo, hi in singles[:10]:
+        iv = {0: [], 1: []}
+        for tr in trains:
+            ts = [r for r in tr["rows"] if lo <= r[0] <= hi]
+            if ts:
+                iv[tr["dir"]].append((min(r[1] for r in ts), max(r[2] for r in ts)))
+        hits, first = 0, None
+        for a0, a1 in iv[0]:
+            for b0, b1 in iv[1]:
+                if a0 < b1 and b0 < a1:
+                    hits += 1
+                    first = first if first is not None else max(a0, b0)
+        if hits:
+            warns.append(f"単線区間 {names[lo]}〜{names[hi]}: 上下列車の重なり {hits} 件（初回 {_fmt(first)} 頃）")
     for d in (0, 1):
         ds = [x for x in trains if x["dir"] == d]
         for ei, e in enumerate(ds):
@@ -1346,6 +1368,9 @@ async def api_submit(req: DiagramRequest, background: BackgroundTasks, t: str = 
                *[q.start for q in req.quad_sections], *[q.end for q in req.quad_sections]]:
         if nm not in known:
             raise HTTPException(400, f"駅名リストにない駅が指定されています: {nm}")
+    for q in req.quad_sections:
+        if q.kind not in ("single", "quad") or q.start == q.end:
+            raise HTTPException(400, "特殊区間の指定が不正です。")
     try:
         _to_sec(req.start_time)
         _to_sec(req.end_time)
