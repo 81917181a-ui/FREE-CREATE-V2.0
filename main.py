@@ -1354,6 +1354,8 @@ def default_params() -> dict:
         "short_turn_every": 0,
         "extra_passing": [],         # 備考で追加された待避可能駅
         "special_sections": [],      # [{start, end, kind}]
+        "service_range": None,       # {a, b}: 全列車が走る区間（始発駅/終着駅の指定）
+        "trip_rules": [],            # 特定の列車を○○駅始発/止まりにする指定
         "start_time": "",            # 備考での開始/終了時刻の上書き
         "end_time": "",
         "applied": [],               # 実際に反映した内容
@@ -1380,6 +1382,10 @@ PARSE_SCHEMA = (
     '  "short_turn_every": 途中折返し列車を何往復に1本走らせるか(整数) または null,\n'
     '  "extra_passing_stations": [待避可能駅に追加する駅],\n'
     '  "special_sections": [{"start": 駅名, "end": 駅名, "kind": "single" または "quad"}],\n'
+    '  "service_range": {"from": 駅名, "to": 駅名} または null (全列車がこの2駅の間だけを走る。始発駅/終着駅の指定),\n'
+    '  "trip_rules": [{"start": 始発にする駅名 または null, "end": 止まりにする駅名 または null, '
+    '"direction": "down"(駅一覧の上から下へ向かう列車) / "up"(その逆) / "both", "every": 何本に1本か または null(全部), '
+    '"sets": [対象の編成番号](空なら全編成), "from": "HH:MM" または null, "to": "HH:MM" または null (その駅を通る時刻帯)}],\n'
     '  "start_time": "HH:MM" または null,\n'
     '  "end_time": "HH:MM" または null,\n'
     '  "unknown_stations": [駅一覧に無い駅名],\n'
@@ -1522,6 +1528,46 @@ def sanitize_params(d: dict, names: list[str]) -> dict:
     if p["special_sections"]:
         ap.append("特殊区間: " + ", ".join(f"{o['start']}〜{o['end']} {'単線' if o['kind'] == 'single' else '複々線'}" for o in p["special_sections"]))
 
+    sr = d.get("service_range")
+    if isinstance(sr, dict):
+        a, b = st(sr.get("from")), st(sr.get("to"))
+        if a and b and a != b:
+            lo, hi = sorted((names.index(a), names.index(b)))
+            p["service_range"] = {"a": names[lo], "b": names[hi]}
+            ap.append(f"運行区間: {names[lo]}〜{names[hi]}（始発駅・終着駅の指定）")
+
+    def _tsec(v):
+        try:
+            return _to_sec(str(v)) if v else None
+        except ValueError:
+            return None
+
+    for o in _lst(d.get("trip_rules"))[:10]:
+        if not isinstance(o, dict):
+            continue
+        s0 = st(o.get("start")) if o.get("start") else ""
+        e0 = st(o.get("end")) if o.get("end") else ""
+        if not (s0 or e0) or (s0 and s0 == e0):
+            continue
+        dr = o.get("direction") if o.get("direction") in ("down", "up") else "both"
+        ev = _num(o.get("every"), 1, 50)
+        sets = [int(x) for x in _lst(o.get("sets")) if _num(x, 1, 50) is not None][:20]
+        tf, tt = _tsec(o.get("from")), _tsec(o.get("to"))
+        rule = {"start": s0, "end": e0, "dir": dr, "every": int(ev) if ev else 0, "sets": sets, "from": tf, "to": tt}
+        cond = []
+        if dr != "both":
+            cond.append("下り" if dr == "down" else "上り")
+        if rule["every"] > 1:
+            cond.append(f"{rule['every']}本に1本")
+        if sets:
+            cond.append("編成" + "・".join(map(str, sets)))
+        if tf is not None or tt is not None:
+            cond.append(f"{_fmt(tf or 0)}〜{_fmt(tt) if tt is not None else '終日'}")
+        what = "、".join(x for x in (f"{s0}始発" if s0 else "", f"{e0}止まり" if e0 else "") if x)
+        rule["desc"] = (" ".join(cond) + " の列車を" if cond else "全列車を") + what
+        p["trip_rules"].append(rule)
+        ap.append(rule["desc"])
+
     for key, label in (("start_time", "開始時刻"), ("end_time", "終了時刻")):
         v = str(d.get(key) or "").strip()
         if v:
@@ -1557,6 +1603,8 @@ async def parse_remarks(remarks: str, names: list[str], info: str = "") -> dict:
         "- 備考中の駅名は必ず駅一覧の表記に直して出力する(「駅」の有無や表記ゆれを補正)。駅一覧に無い駅名は unknown_stations に入れる。\n"
         "- 備考に書かれていない項目は null か空配列にする。推測で埋めない。\n"
         "- 下のキーで表現できない指示は、内容を短く ignored に入れる。\n"
+        "- 全列車が走る区間(始発駅・終着駅の指定)は service_range、特定の列車(何本に1本・編成・時間帯)を途中の駅始発/止まりにする指示は trip_rules に入れる。\n"
+        "  例: 「C駅始発を3本に1本」→ start=C, every=3, direction=both。「7時台の下りはD駅止まり」→ end=D, direction=down, from=07:00, to=07:59。\n"
         "出力JSON:\n" + PARSE_SCHEMA
     )
     last = None
@@ -1578,6 +1626,106 @@ async def parse_remarks(remarks: str, names: list[str], info: str = "") -> dict:
     p["ignored"].append(f"備考の解析に失敗したため反映されていません ({type(last).__name__})")
     p["summary"] = "備考は反映されていません"
     return p
+
+
+def _load_json_obj(raw: str) -> dict:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
+    d = json.loads(raw)
+    if isinstance(d, list) and d:
+        d = d[0]
+    if not isinstance(d, dict):
+        raise ValueError("JSON形式が不正")
+    return d
+
+
+AI_SYSTEM = "あなたは鉄道ダイヤ作成フォームの設定アシスタントです。ユーザーの依頼に合わせてフォームの設定を作り、指定のJSONのみを返してください。"
+
+AI_FORM_GUIDE = (
+    "フォームの項目(formのキー):\n"
+    '- stations: [{"name": 駅名, "seconds": 次の駅までの所要時間(秒)}] 路線の上から順。最後の駅のsecondsは0。\n'
+    "- key_stations: 主要駅の駅名の配列(速達が停車する駅)\n"
+    '- start_time / end_time: "HH:MM"(運行の開始/終了時刻)\n'
+    "- trainsets: 編成数(1〜50の整数)\n"
+    "- remarks: 備考(自由記述)。次のような指示を日本語で書くと、ダイヤ作成時に自動で実行される: "
+    "停車時間(全駅/駅別)、折返し時間、発車間隔、快速など速達の本数・停車駅・速度、通過駅、区間ごとの所要時間、"
+    "途中駅止まりの列車、始発駅/終着駅の指定(運行区間)、特定の列車(何本に1本・編成・時間帯)を○○駅始発/止まりにする、"
+    "待避可能駅や単線/複々線区間の追加、開始/終了時刻\n"
+    "- passing_stations: 待避可能駅の駅名の配列\n"
+    '- special_sections: [{"start": 駅名, "end": 駅名, "kind": "single"(単線) または "quad"(複々線)}] ここに載せない区間は複線\n'
+    "出力先(DM/チャンネル)は設定できません。ユーザー自身が選びます。\n"
+)
+
+AI_OUTPUT_RULES = (
+    '出力JSON: {"reply": 日本語の返答, "form": {変更する項目だけ}}\n'
+    "ルール:\n"
+    "- 変更しない項目は form に含めない。stations を変更するときは全駅を含む完全なリストにする。"
+    "remarks を変更するときは、残したい既存の内容も含めた全文にする。\n"
+    "- 駅名や所要時間の指定がなく実在路線を求められたら、知っている範囲で作る。所要時間は推定で不正確な可能性があると reply で伝える。\n"
+    "- 情報が足りないときは推測で埋めすぎず、reply で質問する。\n"
+    "- reply は簡潔な日本語で、設定した内容を要約する。絵文字は使わない。\n"
+)
+
+
+def build_ai_prompt(message: str, history: list, form_json: str) -> str:
+    hist = "\n".join(f"{'ユーザー' if m.role == 'user' else 'AI'}: {m.text}" for m in history[-10:]) or "なし"
+    return (f"現在のフォームの内容(JSON):\n{form_json}\n\n" + AI_FORM_GUIDE
+            + f"\nこれまでの会話:\n{hist}\n\nユーザーの依頼:\n{message}\n\n" + AI_OUTPUT_RULES)
+
+
+def sanitize_ai_form(raw, cur_names: list[str]) -> dict:
+    """AI が返したフォーム設定を検証し、使える項目だけを返す。"""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    names = list(cur_names)
+    sts = raw.get("stations")
+    if isinstance(sts, list):
+        rows = []
+        for o in sts[:60]:
+            if isinstance(o, dict):
+                nm = str(o.get("name") or "").strip()[:40]
+                sec = _num(o.get("seconds"), 0, 7200)
+                if nm and nm not in [r["name"] for r in rows]:
+                    rows.append({"name": nm, "seconds": int(sec) if sec is not None else 0})
+        if len(rows) >= 2:
+            out["stations"] = rows
+            names = [r["name"] for r in rows]
+
+    def pick(v):
+        res = []
+        for x in _lst(v):
+            nm = resolve_station(x, names)
+            if nm and nm not in res:
+                res.append(nm)
+        return res
+
+    if raw.get("key_stations") is not None:
+        out["key_stations"] = pick(raw.get("key_stations"))
+    if raw.get("passing_stations") is not None:
+        out["passing_stations"] = pick(raw.get("passing_stations"))
+    if raw.get("special_sections") is not None:
+        secs = []
+        for o in _lst(raw.get("special_sections"))[:20]:
+            if isinstance(o, dict):
+                a, b = resolve_station(o.get("start"), names), resolve_station(o.get("end"), names)
+                if a and b and a != b and o.get("kind") in ("single", "quad"):
+                    secs.append({"start": a, "end": b, "kind": o["kind"]})
+        out["special_sections"] = secs
+    for key in ("start_time", "end_time"):
+        v = str(raw.get(key) or "").strip()
+        if v:
+            try:
+                out[key] = _fmt(_to_sec(v))
+            except ValueError:
+                pass
+    x = _num(raw.get("trainsets"), 1, 50)
+    if x is not None:
+        out["trainsets"] = int(x)
+    if isinstance(raw.get("remarks"), str):
+        out["remarks"] = raw["remarks"].strip()[:1000]
+    return out
 
 
 # ---------- 文字数制限に合わせた分割 ----------
@@ -1636,11 +1784,17 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
     dwell_at = {idx[k]: v for k, v in params["station_dwell"].items()}
     turn = params["turnaround_minutes"] * 60
     exp_n, exp_f = params["express_every"], params["express_speed"]
-    ends = {0, n - 1}
+    lo_b, hi_b = 0, n - 1  # 運行区間（備考の始発駅・終着駅の指定）
+    if params["service_range"]:
+        lo_b, hi_b = idx[params["service_range"]["a"]], idx[params["service_range"]["b"]]
+    ends = {lo_b, hi_b}
     key_idx = {idx[k] for k in req.key_stations if k in idx} | {idx[k] for k in params["extra_key"]} | ends
     exp_idx = ({idx[k] for k in params["express_stops"]} | ends) if params["express_stops"] else key_idx
     skip_idx = {idx[k] for k in params["skip_stations"]} - ends
     short_idx = idx.get(params["short_turn_station"])
+    if short_idx is not None and not (lo_b < short_idx < hi_b):
+        params["ignored"].append("途中折返し駅が運行区間の内側にないため、折返し列車は走らせていません")
+        short_idx = None
     short_n = params["short_turn_every"]
     start_time = params["start_time"] or req.start_time
     end_time = params["end_time"] or req.end_time
@@ -1651,7 +1805,7 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
         t1 += 86400  # 日またぎ
 
     def run_trip(direction: int, dep: int, express: bool, hi: int):
-        order = list(range(0, hi + 1)) if direction == 0 else list(range(hi, -1, -1))
+        order = list(range(lo_b, hi + 1)) if direction == 0 else list(range(hi, lo_b - 1, -1))
         last = len(order) - 1
         rows, t = [], dep
         for pos, i in enumerate(order):
@@ -1670,7 +1824,7 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
                 rows.append((i, arr, t, True))
         return rows
 
-    one_way = sum(seg) + sum(dwell_at.get(i, dwell) for i in range(1, n - 1))
+    one_way = sum(seg[lo_b:hi_b]) + sum(dwell_at.get(i, dwell) for i in range(lo_b + 1, hi_b))
     cycle = max(2 * (one_way + turn), 60)
 
     # 発車間隔の指定: 必要な編成数が足りていればその間隔で、足りなければ均等配置
@@ -1691,13 +1845,51 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
             rt = (j // 2) + k
             short = short_idx is not None and short_n > 0 and rt % short_n == 0
             express = exp_n > 0 and rt % exp_n == 0 and not short
-            hi = short_idx if short else n - 1
+            hi = short_idx if short else hi_b
             rows = run_trip(direction, t, express, hi)
             trains.append({"set": k + 1, "dir": direction, "express": express, "short": short, "rows": rows})
             t = rows[-1][1] + turn
             direction ^= 1
             j += 1
     trains.sort(key=lambda x: x["rows"][0][1])
+
+    # 備考: 特定の列車を○○駅始発/止まりにする（全区間の時刻はそのままに、前後を切り落とす）
+    rules = params["trip_rules"]
+    rule_counts = [0] * len(rules)
+    counters = [{0: 0, 1: 0} for _ in rules]
+    for tr in trains:
+        rows = tr["rows"]
+        pos_of = {r[0]: pp for pp, r in enumerate(rows)}
+        for ri, rl in enumerate(rules):
+            if (rl["dir"] == "down" and tr["dir"] != 0) or (rl["dir"] == "up" and tr["dir"] != 1):
+                continue
+            s_i = idx[rl["start"]] if rl["start"] else None
+            e_i = idx[rl["end"]] if rl["end"] else None
+            if (s_i is not None and s_i not in pos_of) or (e_i is not None and e_i not in pos_of):
+                continue
+            sp = pos_of[s_i] if s_i is not None else 0
+            ep = pos_of[e_i] if e_i is not None else len(rows) - 1
+            if sp >= ep:
+                continue
+            if rl["sets"] and tr["set"] not in rl["sets"]:
+                continue
+            if rl["from"] is not None or rl["to"] is not None:
+                x = (rows[sp][2] if s_i is not None else rows[ep][1]) % 86400
+                f0, t0_ = (rl["from"] if rl["from"] is not None else 0), (rl["to"] if rl["to"] is not None else 86399)
+                if not ((f0 <= x <= t0_) if f0 <= t0_ else (x >= f0 or x <= t0_)):
+                    continue
+            counters[ri][tr["dir"]] += 1
+            if rl["every"] > 1 and (counters[ri][tr["dir"]] - 1) % rl["every"] != 0:
+                continue
+            new = rows[sp:ep + 1]
+            new[0] = (new[0][0], new[0][2], new[0][2], True)
+            new[-1] = (new[-1][0], new[-1][1], new[-1][1], True)
+            tr["rows"] = new
+            tr["tag"] = "・".join(x for x in (f"{names[s_i]}始発" if s_i is not None else "", f"{names[e_i]}止まり" if e_i is not None else "") if x)
+            rule_counts[ri] += 1
+            break
+    if rules:
+        trains.sort(key=lambda x: x["rows"][0][1])
 
     # 待避可能駅 / 特殊区間（フォームと備考の両方）
     covered = {idx[s] for s in [*req.passing_stations, *params["extra_passing"]] if s in idx}
@@ -1753,7 +1945,7 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
     L = [
         "【鉄道ダイヤ】",
         f"運行時間 {start_time}〜{end_time} / 編成数 {used} / 停車{dwell}秒 / 折返し{params['turnaround_minutes']}分",
-        f"区間 {names[0]} - {names[-1]} / 主要駅 {', '.join(names[i] for i in sorted(key_idx))}",
+        f"区間 {names[lo_b]} - {names[hi_b]} / 主要駅 {', '.join(names[i] for i in sorted(key_idx))}",
         f"備考の解釈: {params['summary']}",
         "",
     ]
@@ -1763,7 +1955,8 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
         else:
             kind = params["local_name"] + ("(途中折返し)" if tr["short"] else "")
         way = f"{names[tr['rows'][0][0]]}→{names[tr['rows'][-1][0]]}"
-        L.append(f"[{no:03d}] 編成{tr['set']} {way} {kind}")
+        tag = f"[{tr['tag']}]" if tr.get("tag") else ""
+        L.append(f"[{no:03d}] 編成{tr['set']} {way} {kind}{tag}")
         for i, arr, dep, stop in tr["rows"]:
             if not stop:
                 L.append(f"  {names[i]}: 通過 {_fmt(arr)}")
@@ -1776,6 +1969,10 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
     S = [f"ダイヤを作成しました。列車 {len(trains)} 本 / 編成 {used}（指定 {N}） / 追い抜き地点OK {ok_cnt} 件 / 要確認 {len(warns)} 件"]
     if params["applied"]:
         S.append("備考の反映:\n" + "\n".join(f"・{x}" for x in params["applied"]))
+    if rules:
+        S.append("列車指定の適用結果:\n" + "\n".join(
+            f"・{rl['desc']}: {c} 本" if c else f"・{rl['desc']}: 該当する列車がありませんでした"
+            for rl, c in zip(rules, rule_counts)))
     if params["ignored"]:
         S.append("反映できなかった内容:\n" + "\n".join(f"・{x}" for x in params["ignored"]))
     if interval_note:
@@ -1868,6 +2065,41 @@ async def api_submit(req: DiagramRequest, background: BackgroundTasks, t: str = 
         raise HTTPException(400, "出力先が不正です。")
     background.add_task(run_diagram_job, uid, req)  # 即応答・処理は裏で実行
     return {"ok": True, "message": "受け付けました。完了するとDiscordに届きます。"}
+
+
+# ---------- AI アシスタント（フォームの設定を Gemini が作る） ----------
+class AIMsg(BaseModel):
+    role: str
+    text: str = Field("", max_length=2000)
+
+
+class AIRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=1000)
+    history: list[AIMsg] = Field(default=[], max_length=10)
+    form: dict = {}
+
+
+@api.post("/api/ai")
+async def api_ai(req: AIRequest, t: str = ""):
+    verify_web_token(t)
+    if not GEMINI_API_KEY:
+        raise HTTPException(503, "GEMINI_API_KEY が未設定のため、AIは使えません。")
+    form_json = json.dumps(req.form, ensure_ascii=False)
+    if len(form_json) > 20000:
+        raise HTTPException(400, "フォームの内容が大きすぎます。")
+    cur_names = [str(x.get("name", "")).strip() for x in _lst(req.form.get("stations"))
+                 if isinstance(x, dict) and str(x.get("name", "")).strip()]
+    prompt = build_ai_prompt(req.message, req.history, form_json)
+    last = None
+    for _ in range(2):
+        try:
+            raw = await asyncio.wait_for(asyncio.to_thread(gemini_generate, prompt, AI_SYSTEM, True, 40), timeout=45)
+            d = _load_json_obj(raw)
+            return {"reply": str(d.get("reply") or "")[:1500], "form": sanitize_ai_form(d.get("form"), cur_names)}
+        except Exception as e:
+            last = e
+            await asyncio.sleep(1)
+    raise HTTPException(502, f"AIの応答に失敗しました ({type(last).__name__})")
 
 
 # Bot 起動時イベント
