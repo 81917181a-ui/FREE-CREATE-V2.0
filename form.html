@@ -58,7 +58,7 @@
     <label>編成数 <input type="number" id="trainsets" value="4" min="1" max="50" style="width:70px"></label>
   </div>
   <div>備考（自由記述）</div>
-  <textarea id="remarks" placeholder="例: 停車時間は40秒、折返しは5分、快速を2往復に1本走らせる"></textarea>
+  <textarea id="remarks" placeholder="例: 快速を2往復に1本、快速はC駅とE駅に停車。D駅止まりを3往復に1本。B駅は全列車通過。停車時間は40秒、折返しは5分、10分間隔"></textarea>
 </fieldset>
 
 <fieldset>
@@ -144,9 +144,9 @@ function renderStations() {
 
 function updateGapHints() {
   document.querySelectorAll("#stations .gap-hint").forEach((h, i) => {
-    const a = (sts[i] && sts[i].name.trim()) || "?";
-    const b = (sts[i + 1] && sts[i + 1].name.trim()) || "?";
-    h.textContent = a + " - " + b;
+    const a = (sts[i] && sts[i].name.trim()) || "";
+    const b = (sts[i + 1] && sts[i + 1].name.trim()) || "";
+    h.textContent = (a && b) ? a + " - " + b : "";
   });
 }
 
