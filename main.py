@@ -922,9 +922,20 @@ ADMIN_ACTIONS = {
     "unblacklist": ("出禁解除", "出禁を解除するサーバーのID"),
     "botban": ("使用不可ユーザー", "使用不可にするユーザーのID"),
     "unbotban": ("ユーザーバン解除", "使用不可を解除するユーザーのID"),
-    "add_admin": ("管理者追加", "管理者にするユーザーのID"),
-    "fire": ("管理者解除", "管理者権限を解除するユーザーのID"),
 }
+
+# !adminpanel / !banned / 管理パネルを使えるのは、このロールかそれより上位のロールを持つ人のみ（Owner は常に可）
+ADMIN_ROLE_ID = 1510405214811852900
+
+
+def can_manage(user) -> bool:
+    if user.id == OWNER_ID:
+        return True
+    guild = getattr(user, "guild", None)  # DM では Member ではないので不可
+    if guild is None:
+        return False
+    role = guild.get_role(ADMIN_ROLE_ID)
+    return bool(role) and user.top_role.position >= role.position
 
 
 def generate_admin_embed() -> discord.Embed:
@@ -935,7 +946,6 @@ def generate_admin_embed() -> discord.Embed:
     )
     embed.add_field(name="出禁サーバー", value=f"{len(blacklisted_servers)} 件", inline=True)
     embed.add_field(name="使用不可ユーザー", value=f"{len(banned_users)} 人", inline=True)
-    embed.add_field(name="管理者", value=f"{len(admin_users)} 人", inline=True)
     return embed
 
 
@@ -1046,8 +1056,8 @@ class AdminPanelSelect(discord.ui.Select):
                          min_values=1, max_values=1, custom_id="admin_panel_select")
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id not in admin_users:
-            await interaction.response.send_message("この操作は管理者のみ使用できます。", ephemeral=True)
+        if not can_manage(interaction.user):
+            await interaction.response.send_message("この操作を使用する権限がありません。", ephemeral=True)
             return
         key = self.values[0]
         title, label = ADMIN_ACTIONS[key]
@@ -1106,7 +1116,7 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.command(name="banned")
 async def banned_list(ctx):
-    if ctx.author.id not in admin_users:
+    if not can_manage(ctx.author):
         return
     lines = ["【使用不可サーバー】"]
     if blacklisted_servers:
@@ -1205,7 +1215,7 @@ async def botinfo(ctx):
 # 管理者用 コントロールパネル コマンド
 @bot.command(name="adminpanel")
 async def adminpanel(ctx):
-    if ctx.author.id not in admin_users:
+    if not can_manage(ctx.author):
         return
     embed = generate_admin_embed()
     await ctx.send(embed=embed, view=AdminPanelView())
