@@ -26,25 +26,58 @@ from discord.ext import commands
 #   ※ PORT・RENDER_EXTERNAL_URL は Render が自動設定する
 # ==========================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-flash-latest"  # コード側で固定（環境変数を増やさない）
+# 先頭が優先。タイムアウトや混雑のときは順に次のモデルへ切り替える（コード側で固定・環境変数は増やさない）
+GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"]
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://free-create-v2-0-ubpy.onrender.com").rstrip("/")
 PORT = int(os.environ.get("PORT", 8080))
 
 
-def gemini_generate(prompt: str, system: str = "", json_mode: bool = False, timeout: int = 25) -> str:
-  """Gemini REST を同期で呼ぶ（asyncio.to_thread 経由で使う）。"""
+def gemini_generate(prompt: str, system: str = "", json_mode: bool = False, timeout: int = 20, budget: int = 60) -> str:
+  """Gemini REST を同期で呼ぶ（asyncio.to_thread 経由で使う）。
+  - 思考(thinking)を切って高速化する（非対応モデルなら自動で外して再試行）
+  - タイムアウト/混雑/モデル未提供のときは GEMINI_MODELS の次のモデルへ切り替える
+  - budget 秒を超えたら打ち切る
+  """
   if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY が未設定です")
-  url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
   body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
   if system:
     body["systemInstruction"] = {"parts": [{"text": system}]}
+  gen = {"thinkingConfig": {"thinkingBudget": 0}}
   if json_mode:
-    body["generationConfig"] = {"responseMimeType": "application/json", "temperature": 0}
-  r = requests.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=timeout)
-  r.raise_for_status()
-  data = r.json()
-  return data["candidates"][0]["content"]["parts"][0]["text"]
+    gen.update({"responseMimeType": "application/json", "temperature": 0})
+  deadline = time.time() + budget
+  errors = []
+  for model in GEMINI_MODELS:
+    cfg = dict(gen)
+    for _ in range(2):
+      remain = deadline - time.time()
+      if remain < 5:
+        raise RuntimeError("Geminiの応答がタイムアウトしました: " + " / ".join(errors))
+      url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+      try:
+        r = requests.post(url, json={**body, "generationConfig": cfg},
+                          headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=(8, min(timeout, remain)))
+      except requests.exceptions.RequestException as e:
+        errors.append(f"{model}: {type(e).__name__}")
+        break  # 次のモデルへ
+      if r.status_code == 400 and "thinkingConfig" in cfg and "thinking" in r.text.lower():
+        cfg.pop("thinkingConfig")  # このモデルは思考を切れない → 外して再試行
+        continue
+      if r.status_code in (401, 403):
+        raise RuntimeError(f"APIキーが無効か、権限がありません (HTTP {r.status_code})")
+      if r.status_code in (404, 429, 500, 502, 503, 504):
+        errors.append(f"{model}: HTTP {r.status_code}")
+        break
+      if not r.ok:
+        raise RuntimeError(f"Gemini APIエラー (HTTP {r.status_code}): {r.text[:150]}")
+      try:
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+      except (KeyError, IndexError, ValueError):
+        errors.append(f"{model}: 空の応答")
+        break
+  raise RuntimeError("Geminiから応答を得られませんでした: " + " / ".join(errors))
+
 
 # --- 👇 ここを追加・確認する ---
 intents = discord.Intents.default()
@@ -163,7 +196,9 @@ async def search(interaction: discord.Interaction, キーワード: str):
             _search_last.pop(uid, None)  # 失敗した場合は回数を消費しない
         embed = discord.Embed(
             title="🔍 AI検索エラー",
-            description=f"エラーが発生しました: `{e}`\n(GEMINI_API_KEY を確認してください)",
+            description=f"エラーが発生しました: `{str(e)[:300]}`\n" + (
+                "(GEMINI_API_KEY を確認してください)" if "APIキー" in str(e) or "未設定" in str(e)
+                else "(Geminiが混み合っている可能性があります。少し待ってからもう一度お試しください)"),
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed)
@@ -928,9 +963,9 @@ async def parse_remarks(remarks: str, names: list[str], info: str = "") -> dict:
         "出力JSON:\n" + PARSE_SCHEMA
     )
     last = None
-    for _ in range(2):
+    for _ in range(1):  # モデルの切り替えは gemini_generate 内で行う
         try:
-            raw = await asyncio.wait_for(asyncio.to_thread(gemini_generate, prompt, system, True), timeout=35)
+            raw = await asyncio.wait_for(asyncio.to_thread(gemini_generate, prompt, system, True, 20, 50), timeout=60)
             raw = raw.strip()
             if raw.startswith("```"):
                 raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
@@ -943,7 +978,7 @@ async def parse_remarks(remarks: str, names: list[str], info: str = "") -> dict:
         except Exception as e:
             last = e
             await asyncio.sleep(1.5)
-    p["ignored"].append(f"備考の解析に失敗したため反映されていません ({type(last).__name__})")
+    p["ignored"].append(f"備考の解析に失敗したため反映されていません ({str(last)[:150] or type(last).__name__})")
     p["summary"] = "備考は反映されていません"
     return p
 
@@ -1411,15 +1446,15 @@ async def api_ai(req: AIRequest, t: str = ""):
                  if isinstance(x, dict) and str(x.get("name", "")).strip()]
     prompt = build_ai_prompt(req.message, req.history, form_json)
     last = None
-    for _ in range(2):
+    for _ in range(1):  # モデルの切り替えは gemini_generate 内で行う
         try:
-            raw = await asyncio.wait_for(asyncio.to_thread(gemini_generate, prompt, AI_SYSTEM, True, 40), timeout=45)
+            raw = await asyncio.wait_for(asyncio.to_thread(gemini_generate, prompt, AI_SYSTEM, True, 20, 50), timeout=60)
             d = _load_json_obj(raw)
             return {"reply": str(d.get("reply") or "")[:1500], "form": sanitize_ai_form(d.get("form"), cur_names)}
         except Exception as e:
             last = e
             await asyncio.sleep(1)
-    raise HTTPException(502, f"AIの応答に失敗しました ({type(last).__name__})")
+    raise HTTPException(502, f"AIの応答に失敗しました: {str(last)[:150] or type(last).__name__}")
 
 
 # Bot 起動時イベント
