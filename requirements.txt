@@ -3,3 +3,4 @@ psutil>=5.9.0
 fastapi>=0.110.0
 uvicorn>=0.29.0
 requests
+google-auth>=2.0
