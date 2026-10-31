@@ -27,56 +27,92 @@ from discord.ext import commands
 # ==========================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # 先頭が優先。タイムアウトや混雑のときは順に次のモデルへ切り替える（コード側で固定・環境変数は増やさない）
-GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"]
+# 安定版モデルを優先。Gemini 3 系では旧 thinkingBudget / temperature を送らない。
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://free-create-v2-0-ubpy.onrender.com").rstrip("/")
 PORT = int(os.environ.get("PORT", 8080))
 
 
-def gemini_generate(prompt: str, system: str = "", json_mode: bool = False, timeout: int = 20, budget: int = 60) -> str:
-  """Gemini REST を同期で呼ぶ（asyncio.to_thread 経由で使う）。
-  - 思考(thinking)を切って高速化する（非対応モデルなら自動で外して再試行）
-  - タイムアウト/混雑/モデル未提供のときは GEMINI_MODELS の次のモデルへ切り替える
-  - budget 秒を超えたら打ち切る
-  """
+def gemini_generate(prompt: str, system: str = "", json_mode: bool = False,
+                    timeout: int = 20, budget: int = 60, google_search: bool = False) -> str:
+  """Gemini REST を同期で呼ぶ。google_search=True の場合は Google 検索で根拠付けする。"""
   if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY が未設定です")
+
   body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
   if system:
     body["systemInstruction"] = {"parts": [{"text": system}]}
-  gen = {"thinkingConfig": {"thinkingBudget": 0}}
+  if google_search:
+    # Gemini API の Google Search grounding（検索結果の出典は groundingMetadata から取得）
+    body["tools"] = [{"google_search": {}}]
+
+  generation_config = {}
   if json_mode:
-    gen.update({"responseMimeType": "application/json", "temperature": 0})
+    # Gemini 3 系では temperature / thinkingBudget を指定しない。
+    generation_config["responseMimeType"] = "application/json"
+  if generation_config:
+    body["generationConfig"] = generation_config
+
   deadline = time.time() + budget
   errors = []
   for model in GEMINI_MODELS:
-    cfg = dict(gen)
-    for _ in range(2):
-      remain = deadline - time.time()
-      if remain < 5:
-        raise RuntimeError("Geminiの応答がタイムアウトしました: " + " / ".join(errors))
-      url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    remain = deadline - time.time()
+    if remain < 5:
+      break
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    try:
+      r = requests.post(url, json=body,
+                        headers={"x-goog-api-key": GEMINI_API_KEY},
+                        timeout=(8, min(timeout, remain)))
+    except requests.exceptions.RequestException as e:
+      errors.append(f"{model}: {type(e).__name__}")
+      continue
+
+    if r.status_code in (401, 403):
+      raise RuntimeError(f"APIキーが無効か、権限がありません (HTTP {r.status_code})")
+    if r.status_code in (400, 404, 429, 500, 502, 503, 504):
+      # モデルごとの提供状況・一時的な制限を考慮して次候補へ
       try:
-        r = requests.post(url, json={**body, "generationConfig": cfg},
-                          headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=(8, min(timeout, remain)))
-      except requests.exceptions.RequestException as e:
-        errors.append(f"{model}: {type(e).__name__}")
-        break  # 次のモデルへ
-      if r.status_code == 400 and "thinkingConfig" in cfg and "thinking" in r.text.lower():
-        cfg.pop("thinkingConfig")  # このモデルは思考を切れない → 外して再試行
-        continue
-      if r.status_code in (401, 403):
-        raise RuntimeError(f"APIキーが無効か、権限がありません (HTTP {r.status_code})")
-      if r.status_code in (404, 429, 500, 502, 503, 504):
-        errors.append(f"{model}: HTTP {r.status_code}")
-        break
-      if not r.ok:
-        raise RuntimeError(f"Gemini APIエラー (HTTP {r.status_code}): {r.text[:150]}")
-      try:
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-      except (KeyError, IndexError, ValueError):
-        errors.append(f"{model}: 空の応答")
-        break
-  raise RuntimeError("Geminiから応答を得られませんでした: " + " / ".join(errors))
+        detail = r.json().get("error", {}).get("message", "")
+      except ValueError:
+        detail = ""
+      errors.append(f"{model}: HTTP {r.status_code}" + (f" ({detail[:90]})" if detail else ""))
+      continue
+    if not r.ok:
+      raise RuntimeError(f"Gemini APIエラー (HTTP {r.status_code}): {r.text[:150]}")
+
+    try:
+      data = r.json()
+      candidate = data["candidates"][0]
+      parts = candidate["content"]["parts"]
+      answer = "\n".join(p["text"] for p in parts if isinstance(p, dict) and "text" in p).strip()
+      if not answer:
+        raise ValueError("空の応答")
+
+      if google_search:
+        metadata = candidate.get("groundingMetadata") or {}
+        chunks = metadata.get("groundingChunks") or []
+        sources = []
+        seen = set()
+        for chunk in chunks:
+          web = chunk.get("web") if isinstance(chunk, dict) else None
+          if not isinstance(web, dict):
+            continue
+          uri = web.get("uri")
+          title = web.get("title") or uri
+          if uri and uri not in seen:
+            seen.add(uri)
+            sources.append(f"・[{str(title)[:100]}]({uri})")
+          if len(sources) >= 5:
+            break
+        if sources:
+          answer += "\n\n**参照元（Google検索）**\n" + "\n".join(sources)
+      return answer
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+      errors.append(f"{model}: 応答形式エラー ({type(e).__name__})")
+      continue
+
+  raise RuntimeError("Geminiから応答を得られませんでした: " + " / ".join(errors[-3:]))
 
 
 # --- 👇 ここを追加・確認する ---
@@ -157,7 +193,7 @@ SEARCH_COOLDOWN = 60  # 秒
 _search_last = {}  # {user_id: 最後に使った時刻}
 
 
-@bot.tree.command(name="search", description="AI(Gemini)を使って質問や検索をします")
+@bot.tree.command(name="search", description="Google検索を使って質問や最新情報を調べます")
 async def search(interaction: discord.Interaction, キーワード: str):
     uid = interaction.user.id
     limited = uid != OWNER_ID
@@ -178,14 +214,15 @@ async def search(interaction: discord.Interaction, キーワード: str):
         answer_text = await asyncio.to_thread(
             gemini_generate,
             キーワード,
-            "あなたは優秀なアシスタントです。簡潔でわかりやすく答えてください。",
+            "Google検索で確認できる最新情報を優先し、事実と推測を区別して日本語で簡潔に回答してください。検索結果に基づく出典リンクを最後に付けてください。",
+            google_search=True,
         )
         
         if len(answer_text) > 1900:
             answer_text = answer_text[:1900] + "...\n（文字数オーバーのため省略しました）"
 
         embed = discord.Embed(
-            title="🔍 AI検索結果 (Gemini)",
+            title="🔍 Google検索結果 (Gemini)",
             description=f"**検索ワード:** {キーワード}\n\n{answer_text}",
             color=discord.Color.green()
         )
@@ -195,7 +232,7 @@ async def search(interaction: discord.Interaction, キーワード: str):
         if limited:
             _search_last.pop(uid, None)  # 失敗した場合は回数を消費しない
         embed = discord.Embed(
-            title="🔍 AI検索エラー",
+            title="🔍 Google検索エラー",
             description=f"エラーが発生しました: `{str(e)[:300]}`\n" + (
                 "(GEMINI_API_KEY を確認してください)" if "APIキー" in str(e) or "未設定" in str(e)
                 else "(Geminiが混み合っている可能性があります。少し待ってからもう一度お試しください)"),
