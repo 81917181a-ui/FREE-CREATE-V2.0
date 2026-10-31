@@ -28,7 +28,7 @@ from discord.ext import commands
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # 先頭が優先。タイムアウトや混雑のときは順に次のモデルへ切り替える（コード側で固定・環境変数は増やさない）
 # 安定版モデルを優先。Gemini 3 系では旧 thinkingBudget / temperature を送らない。
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-flash"]
+GEMINI_MODELS = ["gemini-3.8-flash"]
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://free-create-v2-0-ubpy.onrender.com").rstrip("/")
 PORT = int(os.environ.get("PORT", 8080))
 
