@@ -29,6 +29,21 @@
   /* 特殊区間 */
   .sp-item { border: 1px solid #111; padding: 8px; margin: 8px 0; }
   .sp-item select { min-width: 100px; }
+  body { padding-bottom: 96px; }
+  /* AI アシスタント */
+  #aiBtn { position: fixed; right: 16px; bottom: 16px; width: 56px; height: 56px; border-radius: 50%; padding: 0;
+           font-size: 16px; font-weight: bold; background: #111; color: #fff; border: 1px solid #111; z-index: 20; }
+  #aiPanel { position: fixed; right: 16px; bottom: 84px; width: min(360px, calc(100vw - 32px)); height: min(480px, 65vh);
+             background: #fff; border: 2px solid #111; display: none; flex-direction: column; z-index: 20; }
+  #aiPanel.open { display: flex; }
+  .ai-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-bottom: 1px solid #111; font-weight: bold; }
+  .ai-head button { padding: 2px 8px; }
+  #aiLog { flex: 1; overflow-y: auto; padding: 8px; font-size: 14px; }
+  .msg { margin: 6px 0; padding: 6px 8px; border: 1px solid #111; white-space: pre-wrap; max-width: 90%; word-break: break-word; }
+  .msg.user { margin-left: auto; background: #111; color: #fff; }
+  .msg.note { border: none; color: #555; font-size: 12px; padding: 0 2px; }
+  .ai-form { display: flex; gap: 6px; padding: 8px; border-top: 1px solid #111; }
+  #aiInput { flex: 1; width: auto; min-width: 0; min-height: 0; height: 44px; resize: none; }
 </style>
 </head>
 <body>
@@ -57,8 +72,8 @@
     <label>終了時間 <input type="time" id="endTime" value="23:00"></label>
     <label>編成数 <input type="number" id="trainsets" value="4" min="1" max="50" style="width:70px"></label>
   </div>
-  <div>備考（自由記述）</div>
-  <textarea id="remarks" placeholder="例: 快速を2往復に1本、快速はC駅とE駅に停車。D駅止まりを3往復に1本。B駅は全列車通過。停車時間は40秒、折返しは5分、10分間隔"></textarea>
+  <div>備考</div>
+  <textarea id="remarks" placeholder="始発駅を指定したり、特定の電車をとある駅始発にしたりできます。&#10;例: C駅始発を3本に1本、快速を2往復に1本、7時台の下りはD駅止まり、停車時間は40秒"></textarea>
 </fieldset>
 
 <fieldset>
@@ -90,6 +105,16 @@
 
 <button type="button" id="submit">出力</button>
 <div id="status"></div>
+
+<button type="button" id="aiBtn">AI</button>
+<div id="aiPanel">
+  <div class="ai-head"><span>AIアシスタント</span><button type="button" class="sub" id="aiClose">閉じる</button></div>
+  <div id="aiLog"></div>
+  <div class="ai-form">
+    <textarea id="aiInput" placeholder="設定したい内容を入力"></textarea>
+    <button type="button" id="aiSend">送信</button>
+  </div>
+</div>
 
 <script>
 const T = new URLSearchParams(location.search).get("t") || "";
@@ -320,6 +345,91 @@ $("submit").onclick = async () => {
     $("submit").disabled = false;
   }
 };
+
+// ---- AI アシスタント ----
+const aiHistory = [];
+
+function aiAdd(kind, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + kind;
+  d.textContent = text;
+  $("aiLog").appendChild(d);
+  $("aiLog").scrollTop = $("aiLog").scrollHeight;
+  return d;
+}
+
+function formState() {
+  return {
+    stations: sts.map(s => ({ name: s.name.trim(), seconds: parseInt(s.sec || "0", 10) || 0 })).filter(s => s.name),
+    key_stations: keys,
+    start_time: $("startTime").value,
+    end_time: $("endTime").value,
+    trainsets: parseInt($("trainsets").value || "1", 10),
+    remarks: $("remarks").value,
+    passing_stations: [...passChecked],
+    special_sections: specials.filter(s => s.kind).map(s => ({ start: s.start, end: s.end, kind: s.kind }))
+  };
+}
+
+function applyAIForm(f) {
+  const ch = [];
+  if (Array.isArray(f.stations) && f.stations.length >= 2) {
+    sts = f.stations.map(s => ({ name: s.name, sec: s.seconds ? String(s.seconds) : "" }));
+    renderStations(); ch.push("駅と所要時間");
+  }
+  if (Array.isArray(f.key_stations)) { keys = f.key_stations.slice(); ch.push("主要駅"); }
+  if (Array.isArray(f.passing_stations)) { passChecked = new Set(f.passing_stations); $("passList").innerHTML = ""; ch.push("退避可能駅"); }
+  if (Array.isArray(f.special_sections)) { specials = f.special_sections.map(s => ({ start: s.start, end: s.end, kind: s.kind })); ch.push("特殊区間"); }
+  if (f.start_time) { $("startTime").value = f.start_time; ch.push("開始時間"); }
+  if (f.end_time) { $("endTime").value = f.end_time; ch.push("終了時間"); }
+  if (f.trainsets) { $("trainsets").value = f.trainsets; ch.push("編成数"); }
+  if (typeof f.remarks === "string") { $("remarks").value = f.remarks; ch.push("備考"); }
+  refresh();
+  return ch;
+}
+
+async function aiSend() {
+  const text = $("aiInput").value.trim();
+  if (!text || $("aiSend").disabled) return;
+  $("aiInput").value = "";
+  aiAdd("user", text);
+  const wait = aiAdd("note", "考え中");
+  $("aiSend").disabled = true;
+  try {
+    const r = await fetch("/api/ai?t=" + encodeURIComponent(T), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, history: aiHistory.slice(-10), form: formState() })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "入力内容を確認してください");
+    wait.remove();
+    aiAdd("ai", j.reply || "(返答がありませんでした)");
+    const changed = applyAIForm(j.form || {});
+    if (changed.length) aiAdd("note", "フォームに反映: " + changed.join("、"));
+    aiHistory.push({ role: "user", text: text }, { role: "ai", text: j.reply || "" });
+  } catch (e) {
+    wait.remove();
+    aiAdd("note", "エラー: " + e.message);
+  } finally {
+    $("aiSend").disabled = false;
+  }
+}
+
+$("aiBtn").onclick = () => {
+  const p = $("aiPanel");
+  p.classList.toggle("open");
+  if (p.classList.contains("open")) {
+    if (!$("aiLog").children.length) {
+      aiAdd("ai", "お手伝いします");
+    }
+    $("aiInput").focus();
+  }
+};
+$("aiClose").onclick = () => $("aiPanel").classList.remove("open");
+$("aiSend").onclick = aiSend;
+$("aiInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); aiSend(); }
+});
 
 renderStations();
 refresh();
