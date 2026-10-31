@@ -4,9 +4,8 @@ import json
 import math
 import traceback
 import re
-import random  # おみくじ等で使用（元コードでは import が抜けていたため追加）
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import time
 from threading import Thread
@@ -19,7 +18,6 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 # ==========================================
@@ -56,20 +54,9 @@ intents.members = (
 intents.message_content = True  # メッセージ内容の取得に必須
 intents.dm_messages = True  # DMの送受信に必須
 
-# 進行中の人狼ゲームを管理する辞書
-active_games = {}  # {channel_id: WolfGameSession}
-
 # ボットの初期化（intents=intents を必ず渡してください）
 bot = commands.Bot(command_prefix="!", intents=intents)
 # ------------------------------
-
-
-# game.pyを読み込む処理（まだ書いていなければ追加）
-@bot.event
-async def on_ready():
-  await bot.load_extension("game")  # game.pyを読み込む
-  await bot.tree.sync()
-  print(f"Logged in as {bot.user}")
 
 
 # ==========================================
@@ -128,674 +115,30 @@ blacklisted_servers = {}  # {server_id: server_name}
 banned_users = {}         # {user_id: user_name}
 admin_users = {OWNER_ID: "Owner"} # {user_id: user_name}
 
-# 入力整形ユーティリティ
-def normalize_input(text: str) -> list[str]:
-    if not text:
-        return []
-    formatted = text.replace("，", ",").replace("、", ",")
-    return [item.strip() for item in formatted.split(",") if item.strip()]
-
-# データ管理クラス
-class TrainData:
-    def __init__(self, line_name: str, author_id: int):
-        self.line_name = line_name
-        self.author_id = author_id
-        self.stations = []
-        self.durations = []
-        self.train_types = {}          # {種別名: [停車駅]}
-        self.start_stations = []       # 始発駅リスト（複数対応）
-        self.end_station = ""          # 終了駅（任意）
-        self.start_time = "06:00"      # 開始時間
-        self.round_trips = 1           # 往復数
-        self.interval_mins = 3         # 運行間隔
-        self.turnaround_mins = 3       # 折り返し時間（分・最大10分制御）
-        self.quad_tracks = ""
-        self.passing_stations = []
-        self.output_target = "thread"  # "thread", "dm", "channel"
-
-user_sessions = {}  # {message_id: TrainData}
-
-# ==========================================
-# 📊 Embed リアルタイム更新用関数
-# ==========================================
-def generate_status_embed(session: TrainData) -> discord.Embed:
-    stations_text = ", ".join(session.stations) if session.stations else "未設定"
-    types_text = ", ".join(session.train_types.keys()) if session.train_types else "未設定"
-    durations_text = ", ".join(map(str, session.durations)) + "秒" if session.durations else "未設定"
-    
-    start_st_text = ", ".join(session.start_stations) if session.start_stations else (session.stations[0] if session.stations else "未設定")
-    end_st_text = session.end_station if session.end_station else "未設定 (自動最遠駅)"
-    start_time_text = session.start_time if session.start_time else "未設定"
-
-    passing_text = ", ".join(session.passing_stations) if session.passing_stations else "なし"
-    quad_text = session.quad_tracks if session.quad_tracks else "なし"
-    
-    target_map = {
-        "thread": "🧵 スレッドに送信",
-        "dm": "📩 DMに送信",
-        "channel": "💬 現在のチャンネルに直接送信"
-    }
-    target_disp = target_map.get(session.output_target, "🧵 スレッドに送信")
-
-    turnaround_disp = min(max(1, session.turnaround_mins), 10)
-
-    embed = discord.Embed(
-        title=f"🚉 {session.line_name} のダイヤを作成中",
-        description=(
-            "**現在の設定:**\n"
-            f"・駅名: {stations_text}\n"
-            f"・種別: {types_text}\n"
-            f"・区間所要時間: {durations_text}\n"
-            f"・始発駅(複数可): {start_st_text}\n"
-            f"・終了駅(任意): {end_st_text}\n"
-            f"・開始時間: {start_time_text}\n"
-            f"・運行往復数: {session.round_trips} 往復（折り返し {turnaround_disp} 分 ※10分以内制限適用）\n"
-            f"・待避可能駅: {passing_text}\n"
-            f"・複々線区間: {quad_text}\n"
-            f"・**出力先設定**: `{target_disp}`\n\n"
-            "───────────────────\n"
-            "👇 **行いたい操作を選択してください**"
-        ),
-        color=0x3498db
-    )
-    return embed
-
-async def update_message_embed(interaction: discord.Interaction, session: TrainData):
-    try:
-        new_embed = generate_status_embed(session)
-        await interaction.message.edit(embed=new_embed)
-    except Exception as e:
-        print(f"Embed update failed: {e}")
-
-# ==========================================
-# ⚙️ モーダル（入力フォーム）類
-# ==========================================
-
-class StationModal(discord.ui.Modal, title="🚉 駅名を登録・編集"):
-    stations_input = discord.ui.TextInput(
-        label="駅名（カンマ区切り・最大50駅）",
-        style=discord.TextStyle.paragraph,
-        placeholder="例: 東京, 神田, 御茶ノ水, 四ツ谷, 新宿",
-        required=True
-    )
-
-    def __init__(self, session_data):
-        super().__init__()
-        self.session_data = session_data
-
-    async def on_submit(self, interaction: discord.Interaction):
-        stations = normalize_input(self.stations_input.value)
-        if len(stations) > 50:
-            await interaction.response.send_message("⚠️ 駅数は最大50駅までです！", ephemeral=True)
-            return
-        self.session_data.stations = stations
-        await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message("✅ 駅名を登録・更新しました！", ephemeral=True)
-
-class TimeModal(discord.ui.Modal, title="⏱️ 時間・運行・過密設定"):
-    durations_input = discord.ui.TextInput(
-        label="各区間の基準所要時間（秒）",
-        placeholder="例: 180, 120, 240, 150",
-        required=True
-    )
-    start_stations_input = discord.ui.TextInput(
-        label="始発駅（カンマ区切りで複数指定可能）",
-        placeholder="例: 東京, 御茶ノ水",
-        required=False
-    )
-    end_station_input = discord.ui.TextInput(
-        label="終了駅（任意・空欄で終点駅）",
-        placeholder="例: 新宿",
-        required=False
-    )
-    start_time_input = discord.ui.TextInput(
-        label="開始時間（1番列車の発車時刻）",
-        placeholder="例: 06:00",
-        default="06:00",
-        required=True
-    )
-    trips_input = discord.ui.TextInput(
-        label="運行往復数 と 折返し時間(分/10分以内)",
-        placeholder="例: 3, 3 (3往復、折り返し3分)",
-        default="2, 3",
-        required=True
-    )
-
-    def __init__(self, session_data):
-        super().__init__()
-        self.session_data = session_data
-
-    async def on_submit(self, interaction: discord.Interaction):
-        durations = [int(d) for d in normalize_input(self.durations_input.value) if d.isdigit()]
-        self.session_data.durations = durations
-        
-        if self.start_stations_input.value.strip():
-            self.session_data.start_stations = normalize_input(self.start_stations_input.value)
-        else:
-            self.session_data.start_stations = []
-
-        if self.end_station_input.value.strip():
-            self.session_data.end_station = self.end_station_input.value.strip()
-        else:
-            self.session_data.end_station = ""
-        
-        self.session_data.start_time = self.start_time_input.value.strip()
-
-        trip_parts = [int(p) for p in normalize_input(self.trips_input.value) if p.isdigit()]
-        if len(trip_parts) >= 1:
-            self.session_data.round_trips = trip_parts[0]
-        if len(trip_parts) >= 2:
-            self.session_data.turnaround_mins = min(trip_parts[1], 10)
-
-        await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message("✅ 時間・過密運行設定を更新しました！（折返しは最大10分以内に制限されます）", ephemeral=True)
-
-class TypeAddModal(discord.ui.Modal, title="➕ 列車種別を追加"):
-    type_name = discord.ui.TextInput(label="種別名", placeholder="例: 急行", required=True)
-    stops = discord.ui.TextInput(label="停車駅", placeholder="例: 全駅停車 または 東京, 御茶ノ水, 新宿", required=True)
-
-    def __init__(self, session_data):
-        super().__init__()
-        self.session_data = session_data
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if len(self.session_data.train_types) >= 30:
-            await interaction.response.send_message("⚠️ 種別は最大30個までです！", ephemeral=True)
-            return
-        t_name = self.type_name.value.strip()
-        stop_list = normalize_input(self.stops.value)
-        self.session_data.train_types[t_name] = stop_list
-        await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message(f"✅ 種別『{t_name}』を追加しました！", ephemeral=True)
-
-class QuadTrackModal(discord.ui.Modal, title="🛤️ 複々線区間を設定"):
-    quad_input = discord.ui.TextInput(label="複々線区間", placeholder="例: 東京〜御茶ノ水", required=True)
-
-    def __init__(self, session_data):
-        super().__init__()
-        self.session_data = session_data
-
-    async def on_submit(self, interaction: discord.Interaction):
-        self.session_data.quad_tracks = self.quad_input.value.strip()
-        await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message("✅ 複々線区間を設定しました！", ephemeral=True)
-
-class PassingModal(discord.ui.Modal, title="🔀 待避可能駅を設定"):
-    passing_input = discord.ui.TextInput(label="待避可能駅", placeholder="例: 御茶ノ水, 四ツ谷", required=True)
-
-    def __init__(self, session_data):
-        super().__init__()
-        self.session_data = session_data
-
-    async def on_submit(self, interaction: discord.Interaction):
-        self.session_data.passing_stations = normalize_input(self.passing_input.value)
-        await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message("✅ 待避可能駅を設定しました！", ephemeral=True)
-
-# ==========================================
-# 📩 出力先選択 View（3つの出力先に対応）
-# ==========================================
-
-class OutputTargetView(discord.ui.View):
-    def __init__(self, session_data):
-        super().__init__(timeout=60)
-        self.session_data = session_data
-
-    @discord.ui.button(label="🧵 スレッドを作成して出力", style=discord.ButtonStyle.primary)
-    async def select_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.session_data.output_target = "thread"
-        await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message("✅ ダイヤの出力先を **スレッド** に設定しました！", ephemeral=True)
-
-    @discord.ui.button(label="📩 DM (ダイレクトメッセージ) に出力", style=discord.ButtonStyle.success)
-    async def select_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.session_data.output_target = "dm"
-        await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message("✅ ダイヤの出力先を **DM** に設定しました！", ephemeral=True)
-
-    @discord.ui.button(label="💬 現在のチャンネルに送信", style=discord.ButtonStyle.secondary)
-    async def select_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.session_data.output_target = "channel"
-        await update_message_embed(interaction, self.session_data)
-        await interaction.response.send_message("✅ ダイヤの出力先を **現在のチャンネル** に設定しました！", ephemeral=True)
-
-# ==========================================
-# 🗑️ ダイヤ用 削除ドロップダウン
-# ==========================================
-
-class DeleteSelect(discord.ui.Select):
-    def __init__(self, session_data):
-        self.session_data = session_data
-        options = [
-            discord.SelectOption(label="🚉 駅名設定を削除", value="stations"),
-            discord.SelectOption(label="⏱️ 時間・運行設定を削除", value="times"),
-            discord.SelectOption(label="🛤️ 複々線区間を削除", value="quad"),
-            discord.SelectOption(label="🎨 列車種別を選択して削除", value="types"),
-            discord.SelectOption(label="🔀 待避可能駅を削除", value="passing"),
-        ]
-        super().__init__(placeholder="🗑️ 削除する項目を選択してください...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        val = self.values[0]
-        if val == "stations":
-            self.session_data.stations = []
-            await update_message_embed(interaction, self.session_data)
-            await interaction.response.send_message("🗑️ 駅名設定を削除しました。", ephemeral=True)
-        elif val == "times":
-            self.session_data.durations = []
-            self.session_data.start_time = "06:00"
-            self.session_data.round_trips = 1
-            self.session_data.end_station = ""
-            self.session_data.start_stations = []
-            await update_message_embed(interaction, self.session_data)
-            await interaction.response.send_message("🗑️ 時間・運行設定を削除しました。", ephemeral=True)
-        elif val == "quad":
-            self.session_data.quad_tracks = ""
-            await update_message_embed(interaction, self.session_data)
-            await interaction.response.send_message("🗑️ 複々線区間設定を削除しました。", ephemeral=True)
-        elif val == "passing":
-            self.session_data.passing_stations = []
-            await update_message_embed(interaction, self.session_data)
-            await interaction.response.send_message("🗑️ 待避可能駅設定を削除しました。", ephemeral=True)
-        elif val == "types":
-            if not self.session_data.train_types:
-                await interaction.response.send_message("⚠️ 削除可能な種別がありません。", ephemeral=True)
-                return
-            view = discord.ui.View()
-            view.add_item(TypeDeleteSelect(self.session_data))
-            await interaction.response.send_message("🗑️ 削除する種別を選択してください:", view=view, ephemeral=True)
-
-class TypeDeleteSelect(discord.ui.Select):
-    def __init__(self, session_data):
-        self.session_data = session_data
-        options = [discord.SelectOption(label=t, value=t) for t in session_data.train_types.keys()]
-        super().__init__(placeholder="🎨 削除する種別を選択してください...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        target = self.values[0]
-        if target in self.session_data.train_types:
-            del self.session_data.train_types[target]
-            await update_message_embed(interaction, self.session_data)
-            await interaction.response.send_message(f"🗑️ 種別『{target}』を削除しました。", ephemeral=True)
-
-# ==========================================
-# ⚙️ メイン操作パネル View
-# ==========================================
-
-class MainControlSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label="🚉 駅名を登録・編集", value="stations"),
-            discord.SelectOption(label="⏱️ 時間・運行設定", value="times"),
-            discord.SelectOption(label="🛤️ 複々線区間を設定", value="quad"),
-            discord.SelectOption(label="➕ 列車種別を追加", value="add_type"),
-            discord.SelectOption(label="🔀 待避可能駅を設定", value="passing"),
-            discord.SelectOption(label="🗑️ 設定を削除", value="delete"),
-            discord.SelectOption(label="🔄 設定を全リセット", value="reset"),
-            discord.SelectOption(label="📩 出力先を設定 (スレッド/DM/チャンネル)", value="output_target"),
-            discord.SelectOption(label="🎨 この設定でダイヤを作成！", value="create"),
-        ]
-        super().__init__(placeholder="⚙️ 操作メニューを選択してください...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        session = user_sessions.get(interaction.message.id)
-        if not session:
-            await interaction.response.send_message("⚠️ セッションが存在しないか、タイムアウトしました。", ephemeral=True)
-            return
-
-        if interaction.user.id != session.author_id:
-            await interaction.response.send_message("⚠️ この操作はコマンドを実行した本人しか使用できません！", ephemeral=True)
-            return
-
-        val = self.values[0]
-
-        if val == "stations":
-            await interaction.response.send_modal(StationModal(session))
-        elif val == "times":
-            await interaction.response.send_modal(TimeModal(session))
-        elif val == "quad":
-            await interaction.response.send_modal(QuadTrackModal(session))
-        elif val == "add_type":
-            await interaction.response.send_modal(TypeAddModal(session))
-        elif val == "passing":
-            await interaction.response.send_modal(PassingModal(session))
-        elif val == "delete":
-            view = discord.ui.View()
-            view.add_item(DeleteSelect(session))
-            await interaction.response.send_message("🗑️ どの情報を削除しますか？", view=view, ephemeral=True)
-        elif val == "reset":
-            session.stations = []
-            session.durations = []
-            session.train_types = {}
-            session.start_stations = []
-            session.end_station = ""
-            session.start_time = "06:00"
-            session.round_trips = 1
-            session.turnaround_mins = 3
-            session.quad_tracks = ""
-            session.passing_stations = []
-            session.output_target = "thread"
-            await update_message_embed(interaction, session)
-            await interaction.response.send_message("🔄 すべての設定をリセットしました！", ephemeral=True)
-        elif val == "output_target":
-            view = OutputTargetView(session)
-            await interaction.response.send_message("📩 ダイヤの出力先を選択してください:", view=view, ephemeral=True)
-        elif val == "create":
-            await interaction.response.defer(ephemeral=True)
-            result_msgs = generate_safe_timetable(session)
-
-            if len(result_msgs) == 1 and result_msgs[0].startswith("⚠️"):
-                await interaction.followup.send(result_msgs[0], ephemeral=True)
-                return
-
-            # --- 1. DM 送信（失敗時はチャンネルへフォールバック） ---
-            if session.output_target == "dm":
-                try:
-                    for msg in result_msgs:
-                        await interaction.user.send(msg)
-                    await interaction.followup.send("✅ DMにダイヤを出力しました！確認してください。", ephemeral=True)
-                except (discord.Forbidden, Exception):
-                    try:
-                        for msg in result_msgs:
-                            await interaction.channel.send(msg)
-                        await interaction.followup.send("⚠️ DMが受信拒否設定になっているため、このチャンネルに直接出力しました！", ephemeral=True)
-                    except Exception as send_err:
-                        await interaction.followup.send(f"⚠️ ダイヤの出力に失敗しました。Botのメッセージ送信権限を確認してください: {send_err}", ephemeral=True)
-
-            # --- 2. スレッド送信（失敗時はチャンネルへフォールバック） ---
-            elif session.output_target == "thread":
-                try:
-                    thread = await interaction.channel.create_thread(
-                        name=f"🚉【{session.line_name}】ダイヤ作成結果",
-                        auto_archive_duration=60
-                    )
-                    for msg in result_msgs:
-                        await thread.send(msg)
-                    await interaction.followup.send(f"✅ スレッド {thread.mention} を作成し、ダイヤを出力しました！", ephemeral=True)
-                except (discord.Forbidden, Exception):
-                    try:
-                        for msg in result_msgs:
-                            await interaction.channel.send(msg)
-                        await interaction.followup.send("⚠️ スレッド作成権限がないため、このチャンネルに直接出力しました！", ephemeral=True)
-                    except Exception as send_err:
-                        await interaction.followup.send(f"⚠️ ダイヤの出力に失敗しました。Botのメッセージ送信権限を確認してください: {send_err}", ephemeral=True)
-
-            # --- 3. 現在のチャンネルに直接送信 ---
-            else:
-                try:
-                    for msg in result_msgs:
-                        await interaction.channel.send(msg)
-                    await interaction.followup.send("✅ このチャンネルにダイヤを出力しました！", ephemeral=True)
-                except Exception as send_err:
-                    await interaction.followup.send(f"⚠️ ダイヤの出力に失敗しました: {send_err}", ephemeral=True)
-
-class MainControlView(discord.ui.View):
-    def __init__(self, timeout=1800):
-        super().__init__(timeout=timeout)
-        self.add_item(MainControlSelect())
-
-# ==========================================
-# 📄 発車10分以内制御 & 2000文字分割対応 ダイヤ計算
-# ==========================================
-
-def generate_safe_timetable(session: TrainData) -> list[str]:
-    if not session.stations or not session.durations:
-        return ["⚠️ ダイヤを作成するには「駅名」と「時間・運行設定」の登録が必要です！"]
-
-    start_sts = session.start_stations if session.start_stations else [session.stations[0]]
-    end_st = session.end_station if session.end_station in session.stations else session.stations[-1]
-
-    try:
-        base_time = datetime.strptime(session.start_time, "%H:%M")
-    except ValueError:
-        base_time = datetime.strptime("06:00", "%H:%M")
-
-    type_names = list(session.train_types.keys()) if session.train_types else ["普通"]
-    safe_turnaround = min(max(1, session.turnaround_mins), 10)
-
-    messages = []
-    current_msg = f"**【{session.line_name} 高密度過密ダイヤ (全列車10分以内発車制御)】**\n"
-    current_msg += f"⏱️ **発車間隔制御：到着・折り返し後【最大10分以内】に即時発車**\n\n"
-
-    for st_idx, start_st in enumerate(start_sts):
-        if start_st not in session.stations:
-            continue
-        
-        s_idx = session.stations.index(start_st)
-        e_idx = session.stations.index(end_st)
-
-        if s_idx > e_idx:
-            s_idx, e_idx = e_idx, s_idx
-
-        t_type = type_names[st_idx % len(type_names)]
-        curr_time = base_time + timedelta(minutes=min(st_idx * 2, 10))
-
-        section_text = f"===============================\n"
-        section_text += f"🚩 **【系統 {st_idx + 1}】始発: {start_st} ➔ 終了: {end_st} ({session.round_trips}往復)**\n"
-        section_text += f"===============================\n"
-
-        for trip in range(1, session.round_trips + 1):
-            # --- 往路 ---
-            section_text += f"🔹 **[{trip}往路] 種別: {t_type}**（{start_st} {curr_time.strftime('%H:%M')}発）\n"
-            for i in range(s_idx, e_idx + 1):
-                st_name = session.stations[i]
-                if i == s_idx:
-                    section_text += f"  ・{st_name}：{curr_time.strftime('%H:%M')} 発 (始発)\n"
-                else:
-                    dur_sec = session.durations[i - 1] if (i - 1) < len(session.durations) else 180
-                    curr_time += timedelta(seconds=dur_sec)
-                    arr_str = curr_time.strftime('%H:%M')
-                    stops = session.train_types.get(t_type, [])
-                    is_stop = ("全駅停車" in stops) or (st_name in stops) or not stops
-
-                    if i == e_idx:
-                        section_text += f"  ・{st_name}：{arr_str} 着 (終着)\n"
-                    elif is_stop:
-                        curr_time += timedelta(seconds=30)
-                        section_text += f"  ・{st_name}：{arr_str}着 / {curr_time.strftime('%H:%M')}発\n"
-                    else:
-                        section_text += f"  ・{st_name}：通過\n"
-
-            curr_time += timedelta(minutes=safe_turnaround)
-
-            # --- 復路 ---
-            section_text += f"🔸 **[{trip}復路] 種別: {t_type}**（{end_st} {curr_time.strftime('%H:%M')}発 折返し）\n"
-            for i in range(e_idx, s_idx - 1, -1):
-                st_name = session.stations[i]
-                if i == e_idx:
-                    section_text += f"  ・{st_name}：{curr_time.strftime('%H:%M')} 発 (折返始発)\n"
-                else:
-                    dur_sec = session.durations[i] if i < len(session.durations) else 180
-                    curr_time += timedelta(seconds=dur_sec)
-                    arr_str = curr_time.strftime('%H:%M')
-                    stops = session.train_types.get(t_type, [])
-                    is_stop = ("全駅停車" in stops) or (st_name in stops) or not stops
-
-                    if i == s_idx:
-                        section_text += f"  ・{st_name}：{arr_str} 着 (到着)\n"
-                    elif is_stop:
-                        curr_time += timedelta(seconds=30)
-                        section_text += f"  ・{st_name}：{arr_str}着 / {curr_time.strftime('%H:%M')}発\n"
-                    else:
-                        section_text += f"  ・{st_name}：通過\n"
-
-            curr_time += timedelta(minutes=safe_turnaround)
-            section_text += "\n"
-
-            # 1800文字超過で自動分割
-            if len(current_msg) + len(section_text) > 1800:
-                messages.append(current_msg)
-                current_msg = section_text
-                section_text = ""
-
-        current_msg += section_text
-
-    if current_msg.strip():
-        messages.append(current_msg)
-
-    return messages
-# ==========================================
-# 🎮 ミニゲームコーナー（おみくじ・じゃんけん・ロシアンルーレット・スロット）
-# ==========================================
-
-# 1. おみくじ (/omikuji)
-@bot.tree.command(name="omikuji", description="今日の運勢を占います！")
-async def omikuji(interaction: discord.Interaction):
-    results = ["大吉 🌟", "中吉 ✨", "小吉 🌙", "吉 🌱", "凶 💧", "大凶 💀"]
-    result = random.choice(results)
-    
-    embed = discord.Embed(
-        title="⛩️ おみくじ",
-        description=f"{interaction.user.mention} さんの今日の運勢は… **{result}** です！",
-        color=discord.Color.gold()
-    )
-    await interaction.response.send_message(embed=embed)
-
-# 2. じゃんけん (/janken)
-@bot.tree.command(name="janken", description="ボットとじゃんけん勝負をします！")
-async def janken(interaction: discord.Interaction, 選択: str):
-    choices = ["グー", "チョキ", "パー"]
-    if 選択 not in choices:
-        await interaction.response.send_message("「グー」「チョキ」「パー」の中から選んでね！", ephemeral=True)
-        return
-    
-    bot_choice = random.choice(choices)
-    
-    if 選択 == bot_choice:
-        outcome = "あいこです！ 🤝"
-        color = discord.Color.light_gray()
-    elif (
-        (選択 == "グー" and bot_choice == "チョキ") or
-        (選択 == "チョキ" and bot_choice == "パー") or
-        (選択 == "パー" and bot_choice == "グー")
-    ):
-        outcome = "あなたの勝ちです！ 🎉"
-        color = discord.Color.green()
-    else:
-        outcome = "あなたの負けです… 😢"
-        color = discord.Color.red()
-        
-    embed = discord.Embed(
-        title="✊ ✋ ✌️ じゃんけん勝負",
-        description=f"あなた: **{選択}**\nボット: **{bot_choice}**\n\n**{outcome}**",
-        color=color
-    )
-    await interaction.response.send_message(embed=embed)
-
-# 3. ボタン式ロシアンルーレット (/russian)
-class RussianButtonView(discord.ui.View):
-    def __init__(self, user):
-        super().__init__(timeout=60.0)
-        self.user = user
-        self.loser_index = random.randint(0, 3)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user != self.user:
-            await interaction.response.send_message("あなたが始めたゲームではありません！", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="ボタン①", style=discord.ButtonStyle.secondary, custom_id="btn_0")
-    async def btn_0(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.check_result(interaction, 0)
-
-    @discord.ui.button(label="ボタン②", style=discord.ButtonStyle.secondary, custom_id="btn_1")
-    async def btn_1(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.check_result(interaction, 1)
-
-    @discord.ui.button(label="ボタン③", style=discord.ButtonStyle.secondary, custom_id="btn_2")
-    async def btn_2(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.check_result(interaction, 2)
-
-    @discord.ui.button(label="ボタン④", style=discord.ButtonStyle.secondary, custom_id="btn_3")
-    async def btn_3(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.check_result(interaction, 3)
-
-    async def check_result(self, interaction, chosen_index):
-        for child in self.children:
-            child.disabled = True
-
-        if chosen_index == self.loser_index:
-            embed = discord.Embed(
-                title="💥 ロシアンルーレット",
-                description=f"{self.user.mention} さん、選んだボタンは… **ハズレ（ドカーン！）** 💥",
-                color=discord.Color.red()
-            )
-        else:
-            embed = discord.Embed(
-                title="✨ ロシアンルーレット",
-                description=f"{self.user.mention} さん、選んだボタンは… **セーフ！** 😌",
-                color=discord.Color.green()
-            )
-
-        await interaction.response.edit_message(embed=embed, view=self)
-        self.stop()
-
-@bot.tree.command(name="russian", description="4つのボタンから1つ選ぶロシアンルーレット！")
-async def russian(interaction: discord.Interaction):
-    view = RussianButtonView(interaction.user)
-    embed = discord.Embed(
-        title="🔫 ロシアンルーレット",
-        description=f"{interaction.user.mention} さん、4つのボタンのうち1つがハズレです。どれか一つを押してください！",
-        color=discord.Color.dark_red()
-    )
-    await interaction.response.send_message(embed=embed, view=view)
-
-import asyncio
-
-# ==========================================
-# 4. スロットゲーム (/slot) アニメーション付き
-# ==========================================
-@bot.tree.command(name="slot", description="スロットを回して運試しをしよう！")
-async def slot(interaction: discord.Interaction):
-    symbols = ["🍒", "🇯🇵", "🔔", "⭐", "💎", "📝"]
-    
-    # 最初に「スロットを回しています…」と送信する
-    embed = discord.Embed(
-        title="🎰 スロットマシン",
-        description="【 🔄 | 🔄 | 🔄 】\n\n**スロット回転中……**",
-        color=discord.Color.blurple()
-    )
-    await interaction.response.send_message(embed=embed)
-    
-    # パタパタと絵文字を変える演出（3回繰り返す）
-    for _ in range(3):
-        await asyncio.sleep(0.6) # 0.6秒ごとに切り替え
-        temp_result = [random.choice(symbols) for _ in range(3)]
-        temp_embed = discord.Embed(
-            title="🎰 スロットマシン",
-            description=f"【 {temp_result[0]} | {temp_result[1]} | {temp_result[2]} 】\n\n**回転中…… 🔄**",
-            color=discord.Color.blurple()
-        )
-        await interaction.edit_original_response(embed=temp_embed)
-    
-    # 最後に最終結果を決定
-    await asyncio.sleep(0.6)
-    result = [random.choice(symbols) for _ in range(3)]
-    
-    if result[0] == result[1] == result[2]:
-        outcome = "大当たり！お見事です！ 🎉✨"
-        color = discord.Color.gold()
-    elif result[0] == result[1] or result[1] == result[2] or result[0] == result[2]:
-        outcome = "惜しい！2つ揃いました！ 👍"
-        color = discord.Color.green()
-    else:
-        outcome = "ハズレ…また挑戦してね！ 😢"
-        color = discord.Color.red()
-        
-    final_embed = discord.Embed(
-        title="🎰 スロットマシン",
-        description=f"【 {result[0]} | {result[1]} | {result[2]} 】\n\n**{outcome}**",
-        color=color
-    )
-    await interaction.edit_original_response(embed=final_embed)
 # ==========================================
 # 🔍 検索コーナー（AI検索・wiki検索）
 # ==========================================
 
-# 5. AI検索 (/search)  ※ 環境変数を2つに絞るため OpenAI → Gemini に変更
+# 5. AI検索 (/search)  ※ Gemini API を使用。OWNER_ID 以外は1分に1回まで
+SEARCH_COOLDOWN = 60  # 秒
+_search_last = {}  # {user_id: 最後に使った時刻}
+
+
 @bot.tree.command(name="search", description="AI(Gemini)を使って質問や検索をします")
 async def search(interaction: discord.Interaction, キーワード: str):
+    uid = interaction.user.id
+    limited = uid != OWNER_ID
+    if limited:
+        now = time.time()
+        for k, t in list(_search_last.items()):  # 古い記録を掃除
+            if now - t >= SEARCH_COOLDOWN:
+                del _search_last[k]
+        wait = SEARCH_COOLDOWN - (now - _search_last.get(uid, 0))
+        if uid in _search_last and wait > 0:
+            await interaction.response.send_message(f"/search は1分に1回まで使えます。あと{int(wait) + 1}秒お待ちください。", ephemeral=True)
+            return
+        _search_last[uid] = now
+
     await interaction.response.defer()
     
     try:
@@ -816,6 +159,8 @@ async def search(interaction: discord.Interaction, キーワード: str):
         await interaction.followup.send(embed=embed)
         
     except Exception as e:
+        if limited:
+            _search_last.pop(uid, None)  # 失敗した場合は回数を消費しない
         embed = discord.Embed(
             title="🔍 AI検索エラー",
             description=f"エラーが発生しました: `{e}`\n(GEMINI_API_KEY を確認してください)",
@@ -1142,28 +487,6 @@ async def banned_list(ctx):
 
 
 # ==========================================
-# 💬 コマンド定義
-# ==========================================
-
-@bot.tree.command(name="create", description="路線ダイヤの作成を開始します")
-@app_commands.describe(路線名="ダイヤを作成する路線名を入力")
-async def create(interaction: discord.Interaction, 路線名: str):
-    if interaction.user.id in banned_users:
-        await interaction.response.send_message("⚠️ あなたは Bot の利用が制限されています。", ephemeral=True)
-        return
-
-    if interaction.guild_id in blacklisted_servers:
-        await interaction.response.send_message("⚠️ このサーバーでは Bot の利用が禁止されています。", ephemeral=True)
-        return
-
-    session_data = TrainData(路線名, interaction.user.id)
-    embed = generate_status_embed(session_data)
-    view = MainControlView(timeout=1800)
-
-    await interaction.response.send_message(embed=embed, view=view)
-    msg = await interaction.original_response()
-    user_sessions[msg.id] = session_data
-# ==========================================
 # 導入サーバー数と合計メンバー数を表示するコマンド (!servers)
 # ==========================================
 @bot.command(name="servers", description="ボットが導入されているサーバー数と合計人数を表示します")
@@ -1222,12 +545,11 @@ async def adminpanel(ctx):
 
     
 # ==========================================
-# 🌐 Web連動 ダイヤ作成システム (/testing)
-#   フロー: /testing → 使い捨てURL発行 → Webフォーム入力
+# 🌐 Web連動 ダイヤ作成システム (/create)
+#   フロー: /create → 使い捨てURL発行 → Webフォーム入力
 #          → POST /api/submit は即応答 → BackgroundTasks で
 #            Gemini解析 + ダイヤ計算 + Discord送信
 # ==========================================
-TESTING_OWNER_ID = 1301944996261400656
 WEB_TOKEN_TTL = 1800  # 秒
 MAX_TRAINS = 3000
 web_tokens = {}  # {token: (user_id, expires_at)}
@@ -1245,15 +567,13 @@ def issue_web_token(user_id: int) -> str:
 def verify_web_token(token: str) -> int:
     v = web_tokens.get(token)
     if not v or v[1] < time.time():
-        raise HTTPException(status_code=401, detail="リンクの有効期限切れです。/testing を再実行してください。")
+        raise HTTPException(status_code=401, detail="リンクの有効期限切れです。/create を再実行してください。")
     return v[0]
 
 
-@bot.tree.command(name="testing", description="Web入力フォームでダイヤを作成します（管理者限定）")
-async def testing(interaction: discord.Interaction):
-    if interaction.user.id != TESTING_OWNER_ID:
-        await interaction.response.send_message("⚠️ このコマンドは使用できません。", ephemeral=True)
-        return
+@bot.tree.command(name="create", description="ダイヤ作成機能")
+async def create(interaction: discord.Interaction):
+    # 使用不可ユーザー・出禁サーバーは _tree_check で弾かれる。それ以外は誰でも使える
     token = issue_web_token(interaction.user.id)
     url = f"{BASE_URL}/form?t={token}"
     await interaction.response.send_message(
