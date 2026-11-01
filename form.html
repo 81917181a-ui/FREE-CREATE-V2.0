@@ -74,6 +74,20 @@
   </div>
   <div>備考</div>
   <textarea id="remarks" placeholder="始発駅を指定したり、特定の電車をとある駅始発にしたりできます。&#10;例: C駅始発を3本に1本、快速を2往復に1本、7時台の下りはD駅止まり、停車時間は40秒"></textarea>
+  <details style="margin-top:6px">
+    <summary>使える書き方</summary>
+    <div style="font-size:13px;line-height:1.7;margin-top:4px">
+      読点(、)か改行で区切って書きます。駅名は駅一覧と同じ名前で書いてください(「駅」は付けても省いても可)。<br>
+      停車時間: 停車時間は40秒 / B駅は60秒停車 / 他は20秒<br>
+      折返し・間隔: 折返しは2分 / 5分間隔<br>
+      速達: 快速を2往復に1本 / 快速はA、C、E駅に停車 / 快速はB駅を通過 / 快速は各停より1割速い<br>
+      通過・追加: D駅は全列車通過 / 待避可能駅にC駅を追加 / 主要駅にB駅を追加<br>
+      区間: A駅からB駅は90秒 / C駅〜E駅は単線 / A駅〜B駅は複々線<br>
+      始発・終着: 始発駅はB駅 / 終着駅はE駅 / A駅〜D駅のみ運行<br>
+      特定の列車: C駅始発を3本に1本 / 7時台の下りはD駅止まり / 編成2はB駅始発 / D駅止まりを2往復に1本<br>
+      時刻: 運行時間は5:30〜24:00 / 6時から運行開始 / 23時30分まで運行終了
+    </div>
+  </details>
 </fieldset>
 
 <fieldset>
@@ -108,12 +122,8 @@
 
 <button type="button" id="aiBtn">AI</button>
 <div id="aiPanel">
-  <div class="ai-head"><span>AIアシスタント</span><button type="button" class="sub" id="aiClose">閉じる</button></div>
-  <div id="aiLog"></div>
-  <div class="ai-form">
-    <textarea id="aiInput" placeholder="設定したい内容を入力"></textarea>
-    <button type="button" id="aiSend">送信</button>
-  </div>
+  <div class="ai-head"><span>AI</span><button type="button" class="sub" id="aiClose">閉じる</button></div>
+  <div id="aiLog"><div class="msg note" style="font-size:16px;color:#111">使用不可</div></div>
 </div>
 
 <script>
@@ -346,90 +356,9 @@ $("submit").onclick = async () => {
   }
 };
 
-// ---- AI アシスタント ----
-const aiHistory = [];
-
-function aiAdd(kind, text) {
-  const d = document.createElement("div");
-  d.className = "msg " + kind;
-  d.textContent = text;
-  $("aiLog").appendChild(d);
-  $("aiLog").scrollTop = $("aiLog").scrollHeight;
-  return d;
-}
-
-function formState() {
-  return {
-    stations: sts.map(s => ({ name: s.name.trim(), seconds: parseInt(s.sec || "0", 10) || 0 })).filter(s => s.name),
-    key_stations: keys,
-    start_time: $("startTime").value,
-    end_time: $("endTime").value,
-    trainsets: parseInt($("trainsets").value || "1", 10),
-    remarks: $("remarks").value,
-    passing_stations: [...passChecked],
-    special_sections: specials.filter(s => s.kind).map(s => ({ start: s.start, end: s.end, kind: s.kind }))
-  };
-}
-
-function applyAIForm(f) {
-  const ch = [];
-  if (Array.isArray(f.stations) && f.stations.length >= 2) {
-    sts = f.stations.map(s => ({ name: s.name, sec: s.seconds ? String(s.seconds) : "" }));
-    renderStations(); ch.push("駅と所要時間");
-  }
-  if (Array.isArray(f.key_stations)) { keys = f.key_stations.slice(); ch.push("主要駅"); }
-  if (Array.isArray(f.passing_stations)) { passChecked = new Set(f.passing_stations); $("passList").innerHTML = ""; ch.push("退避可能駅"); }
-  if (Array.isArray(f.special_sections)) { specials = f.special_sections.map(s => ({ start: s.start, end: s.end, kind: s.kind })); ch.push("特殊区間"); }
-  if (f.start_time) { $("startTime").value = f.start_time; ch.push("開始時間"); }
-  if (f.end_time) { $("endTime").value = f.end_time; ch.push("終了時間"); }
-  if (f.trainsets) { $("trainsets").value = f.trainsets; ch.push("編成数"); }
-  if (typeof f.remarks === "string") { $("remarks").value = f.remarks; ch.push("備考"); }
-  refresh();
-  return ch;
-}
-
-async function aiSend() {
-  const text = $("aiInput").value.trim();
-  if (!text || $("aiSend").disabled) return;
-  $("aiInput").value = "";
-  aiAdd("user", text);
-  const wait = aiAdd("note", "考え中");
-  $("aiSend").disabled = true;
-  try {
-    const r = await fetch("/api/ai?t=" + encodeURIComponent(T), {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, history: aiHistory.slice(-10), form: formState() })
-    });
-    const j = await r.json();
-    if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "入力内容を確認してください");
-    wait.remove();
-    aiAdd("ai", j.reply || "(返答がありませんでした)");
-    const changed = applyAIForm(j.form || {});
-    if (changed.length) aiAdd("note", "フォームに反映: " + changed.join("、"));
-    aiHistory.push({ role: "user", text: text }, { role: "ai", text: j.reply || "" });
-  } catch (e) {
-    wait.remove();
-    aiAdd("note", "エラー: " + e.message);
-  } finally {
-    $("aiSend").disabled = false;
-  }
-}
-
-$("aiBtn").onclick = () => {
-  const p = $("aiPanel");
-  p.classList.toggle("open");
-  if (p.classList.contains("open")) {
-    if (!$("aiLog").children.length) {
-      aiAdd("ai", "お手伝いします");
-    }
-    $("aiInput").focus();
-  }
-};
+// ---- AI (使用不可) ----
+$("aiBtn").onclick = () => $("aiPanel").classList.toggle("open");
 $("aiClose").onclick = () => $("aiPanel").classList.remove("open");
-$("aiSend").onclick = aiSend;
-$("aiInput").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); aiSend(); }
-});
 
 renderStations();
 refresh();
