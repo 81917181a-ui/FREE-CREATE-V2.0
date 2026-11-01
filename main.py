@@ -5,12 +5,13 @@ import math
 import traceback
 import re
 import secrets
+import unicodedata
 from datetime import datetime
 import os
 import time
 from threading import Thread
 import psutil
-import requests  # セルフ・ピン / Gemini REST 呼び出し用
+import requests  # セルフ・ピン用
 
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -21,98 +22,12 @@ import discord
 from discord.ext import commands
 
 # ==========================================
-# 🔑 環境変数（Render に登録するのはこの2つだけ）
-#   DISCORD_BOT_TOKEN / GEMINI_API_KEY
+# 🔑 環境変数（Render に登録するのは DISCORD_BOT_TOKEN だけ）
+#   DISCORD_BOT_TOKEN のみ（AIは使わないので GEMINI_API_KEY は不要）
 #   ※ PORT・RENDER_EXTERNAL_URL は Render が自動設定する
 # ==========================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# 先頭が優先。タイムアウトや混雑のときは順に次のモデルへ切り替える（コード側で固定・環境変数は増やさない）
-# 安定版モデルを優先。Gemini 3 系では旧 thinkingBudget / temperature を送らない。
-GEMINI_MODELS = ["gemini-3.8-flash"]
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://free-create-v2-0-ubpy.onrender.com").rstrip("/")
 PORT = int(os.environ.get("PORT", 8080))
-
-
-def gemini_generate(prompt: str, system: str = "", json_mode: bool = False,
-                    timeout: int = 20, budget: int = 60, google_search: bool = False) -> str:
-  """Gemini REST を同期で呼ぶ。google_search=True の場合は Google 検索で根拠付けする。"""
-  if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY が未設定です")
-
-  body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
-  if system:
-    body["systemInstruction"] = {"parts": [{"text": system}]}
-  if google_search:
-    # Gemini API の Google Search grounding（検索結果の出典は groundingMetadata から取得）
-    body["tools"] = [{"google_search": {}}]
-
-  generation_config = {}
-  if json_mode:
-    # Gemini 3 系では temperature / thinkingBudget を指定しない。
-    generation_config["responseMimeType"] = "application/json"
-  if generation_config:
-    body["generationConfig"] = generation_config
-
-  deadline = time.time() + budget
-  errors = []
-  for model in GEMINI_MODELS:
-    remain = deadline - time.time()
-    if remain < 5:
-      break
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    try:
-      r = requests.post(url, json=body,
-                        headers={"x-goog-api-key": GEMINI_API_KEY},
-                        timeout=(8, min(timeout, remain)))
-    except requests.exceptions.RequestException as e:
-      errors.append(f"{model}: {type(e).__name__}")
-      continue
-
-    if r.status_code in (401, 403):
-      raise RuntimeError(f"APIキーが無効か、権限がありません (HTTP {r.status_code})")
-    if r.status_code in (400, 404, 429, 500, 502, 503, 504):
-      # モデルごとの提供状況・一時的な制限を考慮して次候補へ
-      try:
-        detail = r.json().get("error", {}).get("message", "")
-      except ValueError:
-        detail = ""
-      errors.append(f"{model}: HTTP {r.status_code}" + (f" ({detail[:90]})" if detail else ""))
-      continue
-    if not r.ok:
-      raise RuntimeError(f"Gemini APIエラー (HTTP {r.status_code}): {r.text[:150]}")
-
-    try:
-      data = r.json()
-      candidate = data["candidates"][0]
-      parts = candidate["content"]["parts"]
-      answer = "\n".join(p["text"] for p in parts if isinstance(p, dict) and "text" in p).strip()
-      if not answer:
-        raise ValueError("空の応答")
-
-      if google_search:
-        metadata = candidate.get("groundingMetadata") or {}
-        chunks = metadata.get("groundingChunks") or []
-        sources = []
-        seen = set()
-        for chunk in chunks:
-          web = chunk.get("web") if isinstance(chunk, dict) else None
-          if not isinstance(web, dict):
-            continue
-          uri = web.get("uri")
-          title = web.get("title") or uri
-          if uri and uri not in seen:
-            seen.add(uri)
-            sources.append(f"・[{str(title)[:100]}]({uri})")
-          if len(sources) >= 5:
-            break
-        if sources:
-          answer += "\n\n**参照元（Google検索）**\n" + "\n".join(sources)
-      return answer
-    except (KeyError, IndexError, TypeError, ValueError) as e:
-      errors.append(f"{model}: 応答形式エラー ({type(e).__name__})")
-      continue
-
-  raise RuntimeError("Geminiから応答を得られませんでした: " + " / ".join(errors[-3:]))
 
 
 # --- 👇 ここを追加・確認する ---
@@ -184,61 +99,6 @@ blacklisted_servers = {}  # {server_id: server_name}
 banned_users = {}         # {user_id: user_name}
 admin_users = {OWNER_ID: "Owner"} # {user_id: user_name}
 
-# ==========================================
-# 🔍 検索コーナー（AI検索・wiki検索）
-# ==========================================
-
-# 5. AI検索 (/search)  ※ Gemini API を使用。OWNER_ID 以外は1分に1回まで
-SEARCH_COOLDOWN = 60  # 秒
-_search_last = {}  # {user_id: 最後に使った時刻}
-
-
-@bot.tree.command(name="search", description="Google検索を使って質問や最新情報を調べます")
-async def search(interaction: discord.Interaction, キーワード: str):
-    uid = interaction.user.id
-    limited = uid != OWNER_ID
-    if limited:
-        now = time.time()
-        for k, t in list(_search_last.items()):  # 古い記録を掃除
-            if now - t >= SEARCH_COOLDOWN:
-                del _search_last[k]
-        wait = SEARCH_COOLDOWN - (now - _search_last.get(uid, 0))
-        if uid in _search_last and wait > 0:
-            await interaction.response.send_message(f"/search は1分に1回まで使えます。あと{int(wait) + 1}秒お待ちください。", ephemeral=True)
-            return
-        _search_last[uid] = now
-
-    await interaction.response.defer()
-    
-    try:
-        answer_text = await asyncio.to_thread(
-            gemini_generate,
-            キーワード,
-            "Google検索で確認できる最新情報を優先し、事実と推測を区別して日本語で簡潔に回答してください。検索結果に基づく出典リンクを最後に付けてください。",
-            google_search=True,
-        )
-        
-        if len(answer_text) > 1900:
-            answer_text = answer_text[:1900] + "...\n（文字数オーバーのため省略しました）"
-
-        embed = discord.Embed(
-            title="🔍 Google検索結果 (Gemini)",
-            description=f"**検索ワード:** {キーワード}\n\n{answer_text}",
-            color=discord.Color.green()
-        )
-        await interaction.followup.send(embed=embed)
-        
-    except Exception as e:
-        if limited:
-            _search_last.pop(uid, None)  # 失敗した場合は回数を消費しない
-        embed = discord.Embed(
-            title="🔍 Google検索エラー",
-            description=f"エラーが発生しました: `{str(e)[:300]}`\n" + (
-                "(GEMINI_API_KEY を確認してください)" if "APIキー" in str(e) or "未設定" in str(e)
-                else "(Geminiが混み合っている可能性があります。少し待ってからもう一度お試しください)"),
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed)
 # ==========================================
 # 管理パネル / 使用不可ユーザー・出禁サーバー（Firebase Firestore に保存）
 #   - 鍵ファイルは Render の Secret Files に firebase.json として登録する
@@ -620,7 +480,7 @@ async def adminpanel(ctx):
 # 🌐 Web連動 ダイヤ作成システム (/create)
 #   フロー: /create → 使い捨てURL発行 → Webフォーム入力
 #          → POST /api/submit は即応答 → BackgroundTasks で
-#            Gemini解析 + ダイヤ計算 + Discord送信
+#            備考の読み取り + ダイヤ計算 + Discord送信
 # ==========================================
 WEB_TOKEN_TTL = 1800  # 秒
 MAX_TRAINS = 3000
@@ -727,7 +587,7 @@ def _fmt(sec: int) -> str:
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}"
 
 
-# ---------- Gemini: 備考欄 → パラメータ ----------
+# ---------- 備考欄 → パラメータ（ルールベースの読み取り。AIは使わない） ----------
 def default_params() -> dict:
     return {
         "dwell_seconds": 30,
@@ -739,6 +599,7 @@ def default_params() -> dict:
         "interval_minutes": 0,       # 発車間隔(分)。0=編成数から自動
         "station_dwell": {},         # {駅名: 停車秒}
         "express_stops": [],         # 速達の停車駅（空なら主要駅）
+        "express_pass": [],          # 速達だけが通過する駅
         "extra_key": [],             # 備考で追加された主要駅
         "skip_stations": [],         # 全列車通過駅
         "segment_times": [],         # [{a, b, seconds}]
@@ -754,36 +615,6 @@ def default_params() -> dict:
         "ignored": [],               # 反映できなかった内容
         "summary": "備考なし（既定値を使用）",
     }
-
-
-PARSE_SCHEMA = (
-    "{\n"
-    '  "dwell_seconds": 全駅の標準停車時間(秒) または null,\n'
-    '  "station_dwell": [{"station": 駅名, "seconds": 秒}],\n'
-    '  "turnaround_minutes": 終点での折返し時間(分) または null,\n'
-    '  "interval_minutes": 発車間隔(分) または null,\n'
-    '  "express_every": 速達列車を何往復に1本走らせるか(整数) または null,\n'
-    '  "express_name": 速達の種別名 または null,\n'
-    '  "local_name": 各駅停車の種別名 または null,\n'
-    '  "express_speed": 速達の区間所要時間の倍率(0.5〜1.0。各停より1割速いなら0.9) または null,\n'
-    '  "express_stops": [速達の停車駅(始終点は自動で含まれる)],\n'
-    '  "extra_key_stations": [主要駅に追加する駅],\n'
-    '  "skip_stations": [全列車が通過する駅(始終点を除く)],\n'
-    '  "segment_times": [{"from": 駅名, "to": 駅名, "seconds": その区間の所要秒}],\n'
-    '  "short_turn_station": 途中で折り返す駅名 または null,\n'
-    '  "short_turn_every": 途中折返し列車を何往復に1本走らせるか(整数) または null,\n'
-    '  "extra_passing_stations": [待避可能駅に追加する駅],\n'
-    '  "special_sections": [{"start": 駅名, "end": 駅名, "kind": "single" または "quad"}],\n'
-    '  "service_range": {"from": 駅名, "to": 駅名} または null (全列車がこの2駅の間だけを走る。始発駅/終着駅の指定),\n'
-    '  "trip_rules": [{"start": 始発にする駅名 または null, "end": 止まりにする駅名 または null, '
-    '"direction": "down"(駅一覧の上から下へ向かう列車) / "up"(その逆) / "both", "every": 何本に1本か または null(全部), '
-    '"sets": [対象の編成番号](空なら全編成), "from": "HH:MM" または null, "to": "HH:MM" または null (その駅を通る時刻帯)}],\n'
-    '  "start_time": "HH:MM" または null,\n'
-    '  "end_time": "HH:MM" または null,\n'
-    '  "unknown_stations": [駅一覧に無い駅名],\n'
-    '  "ignored": [上のキーで表現できず対応できなかった指示の要約]\n'
-    "}"
-)
 
 
 def _norm(s) -> str:
@@ -814,310 +645,479 @@ def _lst(v):
     return v if isinstance(v, list) else []
 
 
-def sanitize_params(d: dict, names: list[str]) -> dict:
-    """Gemini の出力を検証し、駅名を正式名称に直して、実際に使える値だけを残す。"""
+# ----- 読み取り用の部品 -----
+_SBASE = 0xE100                      # 駅名は私用領域の1文字(U+E100〜)に置き換えて扱う
+_SC = "[-]"
+_SL = f"{_SC}(?:(?:[・,、]|と|や|および|及び|か)?{_SC})*"   # 駅の並び（A・B・C / AとB）
+_EXPN = "(?:[一-龥ァ-ヶー]{0,3}?(?:快速|急行|特急|準急|特快|速達|ライナー|エクスプレス))"
+
+
+def _dur(p: str) -> str:
+    """所要時間(「40秒」「3分」「1分30秒」)のパターン。グループ名は p_m / p_s / p_so。"""
+    return (rf"(?:(?P<{p}_m>\d+(?:\.\d+)?)\s*分(?:\s*(?P<{p}_s>\d+)\s*秒)?|(?P<{p}_so>\d+(?:\.\d+)?)\s*秒)")
+
+
+def _dur_sec(m, p: str) -> float:
+    if m.group(f"{p}_so"):
+        return float(m.group(f"{p}_so"))
+    return float(m.group(f"{p}_m")) * 60 + (float(m.group(f"{p}_s")) if m.group(f"{p}_s") else 0)
+
+
+_KAN = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _kan2int(s: str) -> int:
+    if not any(c in s for c in "十百"):
+        return int("".join(str(_KAN[c]) for c in s))
+    total, cur = 0, 0
+    for c in s:
+        if c in _KAN:
+            cur = _KAN[c]
+        elif c == "十":
+            total += (cur or 1) * 10
+            cur = 0
+        elif c == "百":
+            total += (cur or 1) * 100
+            cur = 0
+    return total + cur
+
+
+_NOT_STATION = ("主要", "全", "各", "途中", "始発", "終着", "終点", "起点", "待避", "退避", "通過", "停車",
+                "次の", "前の", "隣の", "他の", "その", "この", "同じ", "どの", "各駅停車", "最寄り")
+
+_FILLER = re.compile(
+    r"[\s、。,.．・「」『』()（）\[\]【】:：;；!！?？〜~\-ー…]"
+    r"|ください|下さい|お願い(?:します|いたします)?|にして|にする|して|する|します|したい|ほしい|欲しい|たい|ように|こと|もの|ため"
+    r"|など|等|すべて|全て|全部|全列車|列車|電車|ダイヤ|作成|作って|また|あと|それと|さらに|なお|ただし|基本|ちなみに"
+    r"|です|ます|ので|から|まで|だけ|のみ|その|この|は|が|を|に|で|と|も|の|へ|や|か|ね|よ")
+
+_TIME = r"(\d{1,2})\s*(?::|時)\s*(\d{1,2})?\s*分?"
+_PERIODS = {"早朝": (4, 6), "朝": (6, 10), "昼": (10, 16), "夕方": (16, 20), "夜": (20, 24), "深夜": (0, 4)}
+
+
+def _hhmm(h, m):
+    h, m = int(h), int(m or 0)
+    if h == 24 and m == 0:
+        h = 0
+    if not (0 <= h < 24 and 0 <= m < 60):
+        return None
+    return f"{h:02d}:{m:02d}"
+
+
+def parse_remarks(remarks: str, names: list[str]) -> dict:
+    """備考(自由記述)を読み取り、ダイヤ作成用のパラメータにする。書き方のルールに沿った指示を実行する。"""
     p = default_params()
+    text = unicodedata.normalize("NFKC", remarks or "").replace("~", "〜").replace("～", "〜")
+    if not text.strip():
+        return p
     ap, ig = p["applied"], p["ignored"]
-    unknown = []
+    n = len(names)
 
-    def st(raw):
-        nm = resolve_station(raw, names)
-        if nm is None and _norm(raw):
-            unknown.append(str(raw)[:20])
-        return nm
+    # --- 駅名を1文字の記号に置き換える ---
+    key_of, order = {}, []
+    for i, nm in enumerate(names):
+        k = unicodedata.normalize("NFKC", _norm(nm)).lower()
+        if k and k not in key_of:
+            key_of[k] = i
+            order.append(k)
+    order.sort(key=len, reverse=True)
 
-    def st_list(v):
+    def _alt(k: str) -> str:
+        pre = r"(?<![A-Za-z0-9])" if re.match(r"[A-Za-z0-9]", k) else ""
+        post = r"(?![A-Za-z0-9])" if re.search(r"[A-Za-z0-9]$", k) else ""
+        return f"{pre}{re.escape(k)}{post}"
+
+    if order:
+        st_re = re.compile("(?:" + "|".join(_alt(k) for k in order) + ")駅?", re.I)
+        text = st_re.sub(lambda m: chr(_SBASE + key_of[re.sub(r"駅$", "", m.group(0)).lower()]), text)
+
+    def S(c: str) -> str:
+        return names[ord(c) - _SBASE]
+
+    def SL(s: str) -> list[str]:
         out = []
-        for x in _lst(v):
-            nm = st(x)
-            if nm and nm not in out:
-                out.append(nm)
+        for c in s:
+            if "" <= c <= "" and ord(c) - _SBASE < n and S(c) not in out:
+                out.append(S(c))
         return out
 
-    ends = (names[0], names[-1])
+    # --- 漢数字 → 数字、「編成1、2」のような数字の並びを「・」でつなぐ ---
+    text = re.sub(r"[〇零一二三四五六七八九十百]+(?=[本往分秒時編割番回両倍])", lambda m: str(_kan2int(m.group(0))), text)
+    text = re.sub(r"(?<=\d)\s*[、,]\s*(?=\d)", "・", text)
+    text = re.sub(r"(?<=\d)\s*(?:と|や)\s*(?=\d+\s*(?:番|編成))", "・", text)
 
-    x = _num(d.get("dwell_seconds"), 10, 180)
-    if x is not None:
-        p["dwell_seconds"] = int(x)
-        ap.append(f"全駅の停車時間 {int(x)}秒")
-    x = _num(d.get("turnaround_minutes"), 1, 10)
-    if x is not None:
-        p["turnaround_minutes"] = int(round(x))
-        ap.append(f"折返し時間 {p['turnaround_minutes']}分")
-    x = _num(d.get("interval_minutes"), 1, 60)
-    if x is not None:
-        p["interval_minutes"] = x
-        ap.append(f"発車間隔 {x:g}分")
+    # --- 文ごとに分ける（駅名の並びの途中の読点では切らない） ---
+    pieces = re.split(rf"[。\n;；]+|(?<!{_SC})、|、(?!{_SC})|(?<=[^\d])\s*[,，]\s*(?!{_SC})", text)
+    pieces = [x.strip() for x in pieces if x and x.strip()]
 
-    en = str(d.get("express_name") or "").strip()[:10]
-    ln = str(d.get("local_name") or "").strip()[:10]
-    if en:
-        p["express_name"] = en
-    if ln:
-        p["local_name"] = ln
-    x = _num(d.get("express_every"), 0, 20)
-    if x is not None and int(x) > 0:
-        p["express_every"] = int(x)
-        ap.append(f"{p['express_name']}を{int(x)}往復に1本")
-    x = _num(d.get("express_speed"), 0.5, 1.0)
-    if x is not None and x < 1.0:
-        p["express_speed"] = round(x, 2)
-        ap.append(f"{p['express_name']}の所要時間 x{p['express_speed']}")
-    stops = st_list(d.get("express_stops"))
-    if stops:
-        p["express_stops"] = stops
-        ap.append(f"{p['express_name']}の停車駅: {', '.join(stops)}（始終点は自動で停車）")
-    if (p["express_stops"] or p["express_speed"] < 1.0) and p["express_every"] == 0:
-        ig.append(f"{p['express_name']}の停車駅/速度の指定がありますが本数の指定がないため走らせていません（例: 「{p['express_name']}を2往復に1本」）")
+    unknown_all = []
 
-    keys = st_list(d.get("extra_key_stations"))
-    if keys:
-        p["extra_key"] = keys
-        ap.append(f"主要駅に追加: {', '.join(keys)}")
-    skips = [s for s in st_list(d.get("skip_stations")) if s not in ends]
-    if skips:
-        p["skip_stations"] = skips
-        ap.append(f"全列車通過: {', '.join(skips)}")
+    def need_end(nm):  # 始終点は通過駅/途中折返しにできない
+        return nm in (names[0], names[-1])
 
-    sd = {}
-    for o in _lst(d.get("station_dwell")):
-        if isinstance(o, dict):
-            nm, sec = st(o.get("station")), _num(o.get("seconds"), 0, 600)
-            if nm and sec is not None:
-                sd[nm] = int(sec)
-    if sd:
-        p["station_dwell"] = sd
-        ap.append("駅別の停車時間: " + ", ".join(f"{k} {v}秒" for k, v in sd.items()))
+    for raw_piece in pieces:
+        w = raw_piece
+        raw_piece = re.sub(_SC, lambda m: S(m.group(0)), raw_piece)  # 表示用に駅名へ戻す
+        matched = [False]
 
-    for o in _lst(d.get("segment_times")):
-        if isinstance(o, dict):
-            a, b, sec = st(o.get("from")), st(o.get("to")), _num(o.get("seconds"), 10, 7200)
-            if a and b and a != b and sec is not None:
-                p["segment_times"].append({"a": a, "b": b, "seconds": int(sec)})
-    if p["segment_times"]:
-        ap.append("区間所要時間: " + ", ".join(f"{o['a']}〜{o['b']} {o['seconds']}秒" for o in p["segment_times"]))
-
-    if d.get("short_turn_station"):
-        nm = st(d.get("short_turn_station"))
-        if nm and nm not in ends:
-            ev = _num(d.get("short_turn_every"), 1, 20)
-            p["short_turn_station"] = nm
-            p["short_turn_every"] = int(ev) if ev else 2
-            ap.append(f"{nm}止まりの折返し列車を{p['short_turn_every']}往復に1本" + ("" if ev else "（本数の指定がないため2往復に1本）"))
-        elif nm:
-            ig.append("途中折返し駅に始発駅/終着駅は指定できません")
-
-    ps = st_list(d.get("extra_passing_stations"))
-    if ps:
-        p["extra_passing"] = ps
-        ap.append(f"待避可能駅に追加: {', '.join(ps)}")
-
-    for o in _lst(d.get("special_sections")):
-        if isinstance(o, dict):
-            a, b, kind = st(o.get("start")), st(o.get("end")), o.get("kind")
-            if a and b and a != b and kind in ("single", "quad"):
-                p["special_sections"].append({"start": a, "end": b, "kind": kind})
-    if p["special_sections"]:
-        ap.append("特殊区間: " + ", ".join(f"{o['start']}〜{o['end']} {'単線' if o['kind'] == 'single' else '複々線'}" for o in p["special_sections"]))
-
-    sr = d.get("service_range")
-    if isinstance(sr, dict):
-        a, b = st(sr.get("from")), st(sr.get("to"))
-        if a and b and a != b:
-            lo, hi = sorted((names.index(a), names.index(b)))
-            p["service_range"] = {"a": names[lo], "b": names[hi]}
-            ap.append(f"運行区間: {names[lo]}〜{names[hi]}（始発駅・終着駅の指定）")
-
-    def _tsec(v):
-        try:
-            return _to_sec(str(v)) if v else None
-        except ValueError:
+        def eat(pat, flags=0):
+            m = re.search(pat, w, flags)
+            if m:
+                matched[0] = True
+                return m
             return None
 
-    for o in _lst(d.get("trip_rules"))[:10]:
-        if not isinstance(o, dict):
+        def cut(m):
+            nonlocal w
+            w = w[:m.start()] + " " + w[m.end():]
+
+        # 1. 特殊区間（単線 / 複々線）
+        for pat in (rf"({_SC})(?:から|〜|-)({_SC})(?:間|まで)?(?:の区間)?(?:は|を|が|も)?(単線|複々線|複線)",
+                    rf"(単線|複々線|複線)(?:区間)?(?:は|を|が)?({_SC})(?:から|〜)({_SC})(?:間|まで)?"):
+            while True:
+                m = eat(pat)
+                if not m:
+                    break
+                cut(m)
+                if m.group(1) in ("単線", "複々線", "複線"):
+                    kind_s, a, b = m.group(1), S(m.group(2)), S(m.group(3))
+                else:
+                    a, b, kind_s = S(m.group(1)), S(m.group(2)), m.group(3)
+                if a == b:
+                    continue
+                if kind_s == "複線":
+                    ap.append(f"{a}〜{b}は複線（標準のため指定は不要です）")
+                    continue
+                kind = "single" if kind_s == "単線" else "quad"
+                p["special_sections"].append({"start": a, "end": b, "kind": kind})
+                ap.append(f"特殊区間 {a}〜{b} {kind_s}")
+
+        # 2. 区間ごとの所要時間
+        pat = (rf"({_SC})(?:から|〜|→|-)({_SC})(?:間|まで)?(?:の所要時間|の運転時間|の走行時間)?(?:は|を|が|で)?(?:約)?\s*" + _dur("d") +
+               r"(?:にする|にして|とする|で|かかる)?")
+        while True:
+            m = eat(pat)
+            if not m:
+                break
+            cut(m)
+            a, b, sec = S(m.group(1)), S(m.group(2)), _dur_sec(m, "d")
+            if a == b:
+                continue
+            if 10 <= sec <= 7200:
+                p["segment_times"].append({"a": a, "b": b, "seconds": int(sec)})
+                ap.append(f"区間所要時間 {a}〜{b} {int(sec)}秒")
+            else:
+                ig.append(f"{a}〜{b}の所要時間は10秒〜2時間の範囲で指定してください")
+
+        # 3. 駅ごとの停車時間
+        pat = (rf"({_SL})(?:では|は|で|の|も)?(?:停車時間(?:は|を)?|停車(?:は|を)?|停止(?:は)?)?\s*(?:約)?" + _dur("d") +
+               r"(?:の)?(?:停車|停止|止まる|止まり)?(?:にする|にして|とする|で|ずつ)?")
+        while True:
+            m = eat(pat)
+            if not m:
+                break
+            cut(m)
+            sec = _dur_sec(m, "d")
+            sts = SL(m.group(1))
+            if 0 <= sec <= 600:
+                for nm in sts:
+                    p["station_dwell"][nm] = int(sec)
+                ap.append(f"停車時間 {'・'.join(sts)} {int(sec)}秒")
+            else:
+                ig.append(f"{'・'.join(sts)}の停車時間は0〜600秒の範囲で指定してください")
+
+        # 4. 全駅の停車時間（「他は20秒」も含む）
+        for pat in (r"(?:全駅(?:で|の|は|とも)?|各駅(?:で|の|は)?)?(?:停車時間|停止時間|停車)(?:は|を|が)?(?:一律|各駅)?(?:約)?\s*" + _dur("d") +
+                    r"(?:ずつ|にする|にして|とする|で)?",
+                    r"(?:他|その他|ほか|それ以外)(?:の駅)?(?:は|で)?(?:停車)?\s*" + _dur("d") + r"(?:ずつ)?(?:停車)?(?:にする|にして|とする|で)?",
+                    r"" + _dur("d") + r"(?:ずつ)?(?:停車|停止)(?:する|にする|にして)?"):
+            m = eat(pat)
+            if m:
+                cut(m)
+                sec = _dur_sec(m, "d")
+                if 10 <= sec <= 180:
+                    p["dwell_seconds"] = int(sec)
+                    ap.append(f"全駅の停車時間 {int(sec)}秒")
+                else:
+                    ig.append("全駅の停車時間は10〜180秒の範囲で指定してください")
+                break
+
+        # 5. 折返し時間
+        for pat in (rf"(?<!{_SC})(?:終点(?:での)?)?折り?返し(?:時間|に要する時間|にかかる時間)?(?:は|を|に|で)?(?:約)?\s*" + _dur("d") + r"(?:にする|にして|とする|で)?",
+                    r"" + _dur("d") + r"(?:で|の)折り?返し"):
+            m = eat(pat)
+            if m:
+                cut(m)
+                sec = _dur_sec(m, "d")
+                if 30 <= sec <= 600:
+                    p["turnaround_minutes"] = round(sec / 60, 2) if sec % 60 else int(sec // 60)
+                    ap.append(f"折返し時間 {p['turnaround_minutes']:g}分")
+                else:
+                    ig.append("折返し時間は30秒〜10分の範囲で指定してください")
+                break
+
+        # 6. 発車間隔
+        for pat in (r"(?:発車)?間隔(?:は|を)?(?:約)?\s*(?P<v>\d+(?:\.\d+)?)\s*分(?:おき|ごと|毎)?(?:にする|にして|とする|で)?",
+                    r"(?P<v>\d+(?:\.\d+)?)\s*分\s*(?:間隔|おき|ごと|毎)(?:に|で)?(?:運行|運転|発車)?(?:にする|にして|とする)?",
+                    r"(?P<v>\d+(?:\.\d+)?)\s*分(?:に|毎に|ごとに)\s*1\s*本"):
+            m = eat(pat)
+            if m:
+                cut(m)
+                v = float(m.group("v"))
+                if 1 <= v <= 60:
+                    p["interval_minutes"] = v
+                    ap.append(f"発車間隔 {v:g}分")
+                else:
+                    ig.append("発車間隔は1〜60分の範囲で指定してください")
+                break
+
+        # 7. 速達（快速など）
+        for pat in (rf"(?P<n>{_EXPN})(?:を|は|が)?(?:の本数(?:は|を)?)?(?:約)?\s*(?P<e>\d+)\s*(?:往復|本)(?:に|毎に|ごとに|おきに?)\s*1\s*(?:本|往復)?(?:ずつ)?(?:走らせ(?:る|て)?|運行|運転|設定|入れ(?:る|て)?|にする|にして|で)?",
+                    rf"(?P<e>\d+)\s*(?:往復|本)(?:に|毎に|ごとに)\s*1\s*(?:本|往復)(?:の|は|を)?(?P<n>{_EXPN})"):
+            m = eat(pat)
+            if m:
+                cut(m)
+                ev = int(m.group("e"))
+                name = m.group("n").strip()
+                if 1 <= ev <= 20:
+                    p["express_every"] = ev
+                    p["express_name"] = name
+                    ap.append(f"{name}を{ev}往復に1本")
+                else:
+                    ig.append(f"{name}の本数は1〜20の範囲で指定してください")
+                break
+        m = eat(rf"(?:(?P<n>{_EXPN})(?:の)?(?:所要時間|運転時間)?(?:は|を)?)?(?:各停|各駅停車|普通)(?:より|の)\s*(?P<v>\d+(?:\.\d+)?)\s*(?P<u>割|%|パーセント|倍)(?P<t>程度|ほど|くらい)?(?P<w>速い|早い|短い|短縮|短く|速く|早く|減|少ない)?(?:する|にする|にして|で|になる)?")
+        if m:
+            cut(m)
+            v, u, w_ = float(m.group("v")), m.group("u"), m.group("w")
+            if u == "倍":
+                f = v
+            elif w_:                       # 「各停より1割速い」= 所要時間が1割短い
+                f = 1 - (v / 10 if u == "割" else v / 100)
+            else:                          # 「各停の9割」= 各停の9割の時間
+                f = v / 10 if u == "割" else v / 100
+            if 0.5 <= f < 1.0:
+                p["express_speed"] = round(f, 2)
+                if m.group("n"):
+                    p["express_name"] = m.group("n").strip()
+                ap.append(f"{p['express_name']}の所要時間は各停の{p['express_speed']:g}倍")
+            else:
+                ig.append("速達の所要時間は各停の0.5〜0.99倍の範囲で指定してください")
+        m = eat(rf"(?P<n>{_EXPN})(?:の停車駅|は|では)?(?:は|を|:)?(?P<s>{_SL})以外(?:は|を|では)?通過")
+        if m:
+            cut(m)
+            stops = SL(m.group("s"))
+            p["express_stops"] = stops
+            p["express_name"] = m.group("n").strip()
+            ap.append(f"{p['express_name']}の停車駅: {'・'.join(stops)}（始終点は自動で停車）")
+        for pat in (rf"(?P<n>{_EXPN})(?:の停車駅)?(?:は|では|を|:)?(?P<s>{_SL})(?:のみ|だけ)?(?:に)?(?:のみ|だけ)?(?:は)?(?:停車|止まる|停まる)(?:する|します|とする|にする)?",
+                    rf"(?P<n>{_EXPN})の停車駅(?:は|を|:)?(?P<s>{_SL})(?:のみ|だけ)?(?:にする|とする|にして|です)?"):
+            m = eat(pat)
+            if m:
+                cut(m)
+                stops = SL(m.group("s"))
+                p["express_stops"] = stops
+                p["express_name"] = m.group("n").strip()
+                ap.append(f"{p['express_name']}の停車駅: {'・'.join(stops)}（始終点は自動で停車）")
+                break
+        m = eat(rf"(?P<n>{_EXPN})(?:は|では)?(?P<s>{_SL})(?:を|は|が)?(?:通過|飛ば)(?:する|します|とする|にする)?")
+        if m:
+            cut(m)
+            sts = [x for x in SL(m.group("s")) if not need_end(x)]
+            p["express_name"] = m.group("n").strip()
+            if sts:
+                p["express_pass"].extend(x for x in sts if x not in p["express_pass"])
+                ap.append(f"{p['express_name']}の通過駅: {'・'.join(sts)}")
+            else:
+                ig.append("始発駅・終着駅は通過にできません")
+        m = eat(rf"(?P<n>{_EXPN})(?:は|では)?主要駅(?:のみ|だけ)?(?:に)?(?:のみ)?停車")
+        if m:
+            cut(m)
+            p["express_name"] = m.group("n").strip()
+            ap.append(f"{p['express_name']}は主要駅に停車（既定）")
+
+        # 8. 全列車が通過する駅 / 主要駅の追加 / 待避可能駅の追加
+        m = eat(rf"(?P<s>{_SL})(?:を|は|が|も)?(?:全列車|すべての列車|全ての列車|全種別|全部)?(?:は|が|も)?(?:通過|飛ば|停車しない|止まらない)(?:する|します|とする|にする|させる)?")
+        if m:
+            cut(m)
+            sts = SL(m.group("s"))
+            ok = [x for x in sts if not need_end(x)]
+            if ok:
+                p["skip_stations"].extend(x for x in ok if x not in p["skip_stations"])
+                ap.append(f"全列車通過: {'・'.join(ok)}")
+            if len(ok) < len(sts):
+                ig.append("始発駅・終着駅は通過にできません")
+        for pat in (rf"主要駅(?:は|に|を|として)?(?P<s>{_SL})(?:を|も)?(?:追加|加え|含め|にする|とする|にして|に加え)?(?:る|て)?",
+                    rf"(?P<s>{_SL})(?:を|も|は)主要駅(?:に|として)?(?:追加|加え|含め|にする|とする|にして)?(?:る|て)?"):
+            m = eat(pat)
+            if m:
+                cut(m)
+                sts = SL(m.group("s"))
+                p["extra_key"].extend(x for x in sts if x not in p["extra_key"])
+                ap.append(f"主要駅に追加: {'・'.join(sts)}")
+                break
+        for pat in (rf"(?:待避|退避|追い越し|追越し?|追い抜き)(?:可能|できる)?(?:駅|設備)?(?:は|に|を|として)?(?P<s>{_SL})(?:を|も)?(?:追加|設定|にする|とする|にして)?",
+                    rf"(?P<s>{_SL})(?:を|も|は|に)(?:待避|退避|追い越し|追越し?|追い抜き)(?:可能|できる|駅|設備)?(?:に|として)?(?:追加|設定|にする|とする|にして)?"):
+            m = eat(pat)
+            if m:
+                cut(m)
+                sts = SL(m.group("s"))
+                p["extra_passing"].extend(x for x in sts if x not in p["extra_passing"])
+                ap.append(f"待避可能駅に追加: {'・'.join(sts)}")
+                break
+
+        # 9. 開始・終了時刻
+        pat_rng = (rf"(?:運行(?:時間|時刻)?(?:は)?)?{_TIME}\s*(?:〜|から)\s*{_TIME}\s*(?:まで)?(?:の間)?(?:で|に)?(?:運行|運転)")
+        m = eat(pat_rng) or eat(rf"運行(?:時間|時刻)(?:は)?{_TIME}\s*(?:〜|から)\s*{_TIME}")
+        if m:
+            cut(m)
+            a, b = _hhmm(m.group(1), m.group(2)), _hhmm(m.group(3), m.group(4))
+            if a and b:
+                p["start_time"], p["end_time"] = a, b
+                ap.append(f"運行時間 {a}〜{b}")
+            else:
+                ig.append("運行時間の時刻を読み取れませんでした")
+        for pat, key, label in (
+                (rf"(?<!{_SC})(?:運行|ダイヤ)?(?:開始|始発|初発)(?:時刻|時間)?(?:は|を)?\s*{_TIME}(?:から|に|にする|とする|で)?", "start_time", "開始時刻"),
+                (rf"{_TIME}\s*(?:から|より)(?:運行|運転|ダイヤ)?(?:を)?(?:開始|スタート|始め)", "start_time", "開始時刻"),
+                (rf"(?:運行|ダイヤ)?(?:終了|終電|最終)(?:時刻|時間)?(?:は|を)?\s*{_TIME}(?:まで|に|にする|とする|で)?", "end_time", "終了時刻"),
+                (rf"{_TIME}\s*(?:まで)(?:に)?(?:運行|運転|ダイヤ)?(?:を)?(?:終了|終わり|終える)", "end_time", "終了時刻")):
+            m = eat(pat)
+            if m:
+                cut(m)
+                v = _hhmm(m.group(1), m.group(2))
+                if v:
+                    p[key] = v
+                    ap.append(f"{label} {v}")
+                else:
+                    ig.append(f"{label}を読み取れませんでした")
+
+        # 10. 始発/止まりの指定（特定の列車 / 運行区間 / 途中折返し）
+        P_A = rf"(?P<s>{_SC})(?:を|から|で)?(?:始発駅?)"
+        P_B = rf"(?P<s>{_SC})(?:を|で|にて)?(?:止まり|止り|行き|ゆき|折り?返し|終着|終点)"
+        P_A2 = rf"(?:始発駅?|起点|出発駅?)(?:は|を|:)\s*(?P<s>{_SC})"
+        P_B2 = rf"(?:終着駅?|終点|終着)(?:は|を|:)\s*(?P<s>{_SC})"
+        sA, sB, sA2, sB2 = (re.search(x, w) for x in (P_A, P_B, P_A2, P_B2))
+        rng = re.search(rf"(?P<a>{_SC})(?:から|〜|-)(?P<b>{_SC})(?:まで)?(?:間)?(?:のみ|だけ|の区間)?(?:で|を|は)?(?:運行|運転|走る|走ります)", w) \
+            or re.search(rf"運行区間(?:は|を|:)?\s*(?P<a>{_SC})(?:から|〜|-)(?P<b>{_SC})", w)
+        if rng:
+            matched[0] = True
+            cut(rng)
+            a, b = S(rng.group("a")), S(rng.group("b"))
+            if a != b:
+                lo, hi = sorted((names.index(a), names.index(b)))
+                p["service_range"] = {"a": names[lo], "b": names[hi]}
+                ap.append(f"運行区間 {names[lo]}〜{names[hi]}（始発駅・終着駅の指定）")
+        elif sA or sB or sA2 or sB2:
+            matched[0] = True
+            start_nm = S((sA or sA2).group("s")) if (sA or sA2) else ""
+            end_nm = S((sB or sB2).group("s")) if (sB or sB2) else ""
+            conds, has_cond = [], False
+            m = re.search(r"(?P<n>\d+)\s*(?P<u>本|往復)(?:に|毎に|ごとに|おきに?)\s*1\s*(?:本|往復)?", w)
+            every, every_unit = 0, ""
+            if m:
+                every, every_unit = int(m.group("n")), m.group("u")
+                w = w[:m.start()] + " " + w[m.end():]
+                has_cond = True
+            dr = "both"
+            ds = set(re.findall(r"下り|上り", w))
+            if len(ds) == 1:
+                dr = "down" if "下り" in ds else "up"
+                has_cond = True
+            w = re.sub(r"下り|上り", " ", w)
+            sets = []
+            for pt in (r"(?:第)?編成\s*(\d+(?:・\d+)*)(?:番)?(?:目)?", r"(\d+(?:・\d+)*)\s*(?:号)?(?:編成|番編成)(?:目)?"):
+                m = re.search(pt, w)
+                if m:
+                    sets = [int(x) for x in m.group(1).split("・") if 1 <= int(x) <= 50][:20]
+                    w = w[:m.start()] + " " + w[m.end():]
+                    has_cond = True
+                    break
+            tf = tt = None
+            m = re.search(rf"{_TIME}\s*(?:〜|から)\s*{_TIME}\s*(?:の間|まで|の)?", w)
+            if m:
+                a_, b_ = _hhmm(m.group(1), m.group(2)), _hhmm(m.group(3), m.group(4))
+                if a_ and b_:
+                    tf, tt = _to_sec(a_), _to_sec(b_)
+                    has_cond = True
+                w = w[:m.start()] + " " + w[m.end():]
+            else:
+                m = re.search(r"(\d{1,2})\s*時台(?:の|に)?", w)
+                if m and 0 <= int(m.group(1)) < 24:
+                    tf, tt = int(m.group(1)) * 3600, int(m.group(1)) * 3600 + 3599
+                    has_cond = True
+                    w = w[:m.start()] + " " + w[m.end():]
+                else:
+                    m = re.search(r"(早朝|朝|昼|夕方|深夜|夜)(?:の|に)?", w)
+                    if m:
+                        h0, h1 = _PERIODS[m.group(1)]
+                        tf, tt = h0 * 3600, h1 * 3600 - 1
+                        has_cond = True
+                        w = w[:m.start()] + " " + w[m.end():]
+            if re.search(_EXPN, w):
+                ig.append(f"「{raw_piece}」: 種別(快速など)を指定した始発/止まりの指定には対応していません")
+                w = re.sub(_EXPN, " ", w)
+                start_nm = end_nm = ""
+            for x in (P_A, P_B, P_A2, P_B2):
+                w = re.sub(x, " ", w)
+            if start_nm and start_nm == end_nm:
+                ig.append(f"「{raw_piece}」: 始発駅と終着駅が同じです")
+            elif start_nm or end_nm:
+                is_end_only = bool(end_nm) and not start_nm
+                if not has_cond:
+                    # 条件なし: 全列車の運行区間（始発駅/終着駅の指定）
+                    a_i = names.index(start_nm) if start_nm else 0
+                    b_i = names.index(end_nm) if end_nm else n - 1
+                    cur = p["service_range"]
+                    if cur:
+                        if not start_nm:
+                            a_i = names.index(cur["a"])
+                        if not end_nm:
+                            b_i = names.index(cur["b"])
+                    lo, hi = sorted((a_i, b_i))
+                    p["service_range"] = {"a": names[lo], "b": names[hi]}
+                    ap.append(f"運行区間 {names[lo]}〜{names[hi]}（始発駅・終着駅の指定）")
+                elif is_end_only and every_unit == "往復" and dr == "both" and not sets and tf is None:
+                    if need_end(end_nm):
+                        ig.append(f"「{raw_piece}」: 途中折返し駅に始発駅/終着駅は指定できません")
+                    else:
+                        p["short_turn_station"], p["short_turn_every"] = end_nm, every or 2
+                        ap.append(f"{end_nm}止まりの折返し列車を{p['short_turn_every']}往復に1本")
+                else:
+                    if len(p["trip_rules"]) >= 10:
+                        ig.append(f"「{raw_piece}」: 始発/止まりの指定は10件までです")
+                    else:
+                        rule = {"start": start_nm, "end": end_nm, "dir": dr, "every": every if every > 1 else 0,
+                                "sets": sets, "from": tf, "to": tt}
+                        cond = []
+                        if dr != "both":
+                            cond.append("下り" if dr == "down" else "上り")
+                        if rule["every"] > 1:
+                            cond.append(f"{rule['every']}本に1本")
+                        if sets:
+                            cond.append("編成" + "・".join(map(str, sets)))
+                        if tf is not None:
+                            cond.append(f"{_fmt(tf)}〜{_fmt(tt)}")
+                        what = "、".join(x for x in (f"{start_nm}始発" if start_nm else "", f"{end_nm}止まり" if end_nm else "") if x)
+                        rule["desc"] = (" ".join(cond) + " の列車を" if cond else "全列車を") + what
+                        p["trip_rules"].append(rule)
+                        ap.append(rule["desc"])
+
+        # --- 読み取れなかった部分の報告 ---
+        unk = [t for t in re.findall(r"([A-Za-z0-9一-龥ァ-ヶー]{1,10})駅", w)
+               if not any(t.endswith(x) for x in _NOT_STATION)]
+        if unk:
+            unknown_all.extend(unk)
+            ig.append(f"「{raw_piece}」: 駅名リストにない駅（{'・'.join(dict.fromkeys(unk))}）が含まれるため反映できませんでした")
             continue
-        s0 = st(o.get("start")) if o.get("start") else ""
-        e0 = st(o.get("end")) if o.get("end") else ""
-        if not (s0 or e0) or (s0 and s0 == e0):
-            continue
-        dr = o.get("direction") if o.get("direction") in ("down", "up") else "both"
-        ev = _num(o.get("every"), 1, 50)
-        sets = [int(x) for x in _lst(o.get("sets")) if _num(x, 1, 50) is not None][:20]
-        tf, tt = _tsec(o.get("from")), _tsec(o.get("to"))
-        rule = {"start": s0, "end": e0, "dir": dr, "every": int(ev) if ev else 0, "sets": sets, "from": tf, "to": tt}
-        cond = []
-        if dr != "both":
-            cond.append("下り" if dr == "down" else "上り")
-        if rule["every"] > 1:
-            cond.append(f"{rule['every']}本に1本")
-        if sets:
-            cond.append("編成" + "・".join(map(str, sets)))
-        if tf is not None or tt is not None:
-            cond.append(f"{_fmt(tf or 0)}〜{_fmt(tt) if tt is not None else '終日'}")
-        what = "、".join(x for x in (f"{s0}始発" if s0 else "", f"{e0}止まり" if e0 else "") if x)
-        rule["desc"] = (" ".join(cond) + " の列車を" if cond else "全列車を") + what
-        p["trip_rules"].append(rule)
-        ap.append(rule["desc"])
+        rest = _FILLER.sub("", re.sub(_SC, "", w))
+        if len(rest) >= 2:
+            ig.append(f"「{raw_piece}」: 読み取れませんでした" if not matched[0] else f"「{raw_piece}」: 一部を読み取れませんでした（{rest[:20]}）")
 
-    for key, label in (("start_time", "開始時刻"), ("end_time", "終了時刻")):
-        v = str(d.get(key) or "").strip()
-        if v:
-            try:
-                p[key] = _fmt(_to_sec(v))
-                ap.append(f"{label} {p[key]}")
-            except ValueError:
-                ig.append(f"{label}「{v}」は HH:MM 形式として読み取れませんでした")
-
-    unk = list(dict.fromkeys(unknown + [str(x)[:20] for x in _lst(d.get("unknown_stations")) if x]))
-    if unk:
-        ig.append("駅名リストにない駅: " + ", ".join(unk))
-    ig.extend(str(x)[:80] for x in _lst(d.get("ignored"))[:8] if x)
-
+    if (p["express_stops"] or p["express_pass"] or p["express_speed"] < 1.0) and p["express_every"] == 0:
+        ig.append(f"{p['express_name']}の停車駅/速度の指定がありますが本数の指定がないため走らせていません（例: 「{p['express_name']}を2往復に1本」）")
     p["summary"] = "、".join(ap) if ap else "備考から反映できる指定はありませんでした"
     return p
-
-
-async def parse_remarks(remarks: str, names: list[str], info: str = "") -> dict:
-    p = default_params()
-    if not remarks.strip():
-        return p
-    if not GEMINI_API_KEY:
-        p["ignored"].append("GEMINI_API_KEY が未設定のため備考は反映されていません")
-        p["summary"] = "備考は反映されていません"
-        return p
-    system = "あなたは鉄道ダイヤ作成システムの入力解析器です。備考の指示を指定のJSONに変換し、JSONのみを返してください。"
-    prompt = (
-        f"駅一覧(路線の上から順): {', '.join(names)}\n"
-        f"フォーム設定: {info}\n"
-        f"備考:\n{remarks}\n\n"
-        "ルール:\n"
-        "- 備考中の駅名は必ず駅一覧の表記に直して出力する(「駅」の有無や表記ゆれを補正)。駅一覧に無い駅名は unknown_stations に入れる。\n"
-        "- 備考に書かれていない項目は null か空配列にする。推測で埋めない。\n"
-        "- 下のキーで表現できない指示は、内容を短く ignored に入れる。\n"
-        "- 全列車が走る区間(始発駅・終着駅の指定)は service_range、特定の列車(何本に1本・編成・時間帯)を途中の駅始発/止まりにする指示は trip_rules に入れる。\n"
-        "  例: 「C駅始発を3本に1本」→ start=C, every=3, direction=both。「7時台の下りはD駅止まり」→ end=D, direction=down, from=07:00, to=07:59。\n"
-        "出力JSON:\n" + PARSE_SCHEMA
-    )
-    last = None
-    for _ in range(1):  # モデルの切り替えは gemini_generate 内で行う
-        try:
-            raw = await asyncio.wait_for(asyncio.to_thread(gemini_generate, prompt, system, True, 20, 50), timeout=60)
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
-            d = json.loads(raw)
-            if isinstance(d, list) and d:
-                d = d[0]
-            if not isinstance(d, dict):
-                raise ValueError("JSON形式が不正")
-            return sanitize_params(d, names)
-        except Exception as e:
-            last = e
-            await asyncio.sleep(1.5)
-    p["ignored"].append(f"備考の解析に失敗したため反映されていません ({str(last)[:150] or type(last).__name__})")
-    p["summary"] = "備考は反映されていません"
-    return p
-
-
-def _load_json_obj(raw: str) -> dict:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
-    d = json.loads(raw)
-    if isinstance(d, list) and d:
-        d = d[0]
-    if not isinstance(d, dict):
-        raise ValueError("JSON形式が不正")
-    return d
-
-
-AI_SYSTEM = "あなたは鉄道ダイヤ作成フォームの設定アシスタントです。ユーザーの依頼に合わせてフォームの設定を作り、指定のJSONのみを返してください。"
-
-AI_FORM_GUIDE = (
-    "フォームの項目(formのキー):\n"
-    '- stations: [{"name": 駅名, "seconds": 次の駅までの所要時間(秒)}] 路線の上から順。最後の駅のsecondsは0。\n'
-    "- key_stations: 主要駅の駅名の配列(速達が停車する駅)\n"
-    '- start_time / end_time: "HH:MM"(運行の開始/終了時刻)\n'
-    "- trainsets: 編成数(1〜50の整数)\n"
-    "- remarks: 備考(自由記述)。次のような指示を日本語で書くと、ダイヤ作成時に自動で実行される: "
-    "停車時間(全駅/駅別)、折返し時間、発車間隔、快速など速達の本数・停車駅・速度、通過駅、区間ごとの所要時間、"
-    "途中駅止まりの列車、始発駅/終着駅の指定(運行区間)、特定の列車(何本に1本・編成・時間帯)を○○駅始発/止まりにする、"
-    "待避可能駅や単線/複々線区間の追加、開始/終了時刻\n"
-    "- passing_stations: 待避可能駅の駅名の配列\n"
-    '- special_sections: [{"start": 駅名, "end": 駅名, "kind": "single"(単線) または "quad"(複々線)}] ここに載せない区間は複線\n'
-    "出力先(DM/チャンネル)は設定できません。ユーザー自身が選びます。\n"
-)
-
-AI_OUTPUT_RULES = (
-    '出力JSON: {"reply": 日本語の返答, "form": {変更する項目だけ}}\n'
-    "ルール:\n"
-    "- 変更しない項目は form に含めない。stations を変更するときは全駅を含む完全なリストにする。"
-    "remarks を変更するときは、残したい既存の内容も含めた全文にする。\n"
-    "- 駅名や所要時間の指定がなく実在路線を求められたら、知っている範囲で作る。所要時間は推定で不正確な可能性があると reply で伝える。\n"
-    "- 情報が足りないときは推測で埋めすぎず、reply で質問する。\n"
-    "- reply は簡潔な日本語で、設定した内容を要約する。絵文字は使わない。\n"
-)
-
-
-def build_ai_prompt(message: str, history: list, form_json: str) -> str:
-    hist = "\n".join(f"{'ユーザー' if m.role == 'user' else 'AI'}: {m.text}" for m in history[-10:]) or "なし"
-    return (f"現在のフォームの内容(JSON):\n{form_json}\n\n" + AI_FORM_GUIDE
-            + f"\nこれまでの会話:\n{hist}\n\nユーザーの依頼:\n{message}\n\n" + AI_OUTPUT_RULES)
-
-
-def sanitize_ai_form(raw, cur_names: list[str]) -> dict:
-    """AI が返したフォーム設定を検証し、使える項目だけを返す。"""
-    out = {}
-    if not isinstance(raw, dict):
-        return out
-    names = list(cur_names)
-    sts = raw.get("stations")
-    if isinstance(sts, list):
-        rows = []
-        for o in sts[:60]:
-            if isinstance(o, dict):
-                nm = str(o.get("name") or "").strip()[:40]
-                sec = _num(o.get("seconds"), 0, 7200)
-                if nm and nm not in [r["name"] for r in rows]:
-                    rows.append({"name": nm, "seconds": int(sec) if sec is not None else 0})
-        if len(rows) >= 2:
-            out["stations"] = rows
-            names = [r["name"] for r in rows]
-
-    def pick(v):
-        res = []
-        for x in _lst(v):
-            nm = resolve_station(x, names)
-            if nm and nm not in res:
-                res.append(nm)
-        return res
-
-    if raw.get("key_stations") is not None:
-        out["key_stations"] = pick(raw.get("key_stations"))
-    if raw.get("passing_stations") is not None:
-        out["passing_stations"] = pick(raw.get("passing_stations"))
-    if raw.get("special_sections") is not None:
-        secs = []
-        for o in _lst(raw.get("special_sections"))[:20]:
-            if isinstance(o, dict):
-                a, b = resolve_station(o.get("start"), names), resolve_station(o.get("end"), names)
-                if a and b and a != b and o.get("kind") in ("single", "quad"):
-                    secs.append({"start": a, "end": b, "kind": o["kind"]})
-        out["special_sections"] = secs
-    for key in ("start_time", "end_time"):
-        v = str(raw.get(key) or "").strip()
-        if v:
-            try:
-                out[key] = _fmt(_to_sec(v))
-            except ValueError:
-                pass
-    x = _num(raw.get("trainsets"), 1, 50)
-    if x is not None:
-        out["trainsets"] = int(x)
-    if isinstance(raw.get("remarks"), str):
-        out["remarks"] = raw["remarks"].strip()[:1000]
-    return out
 
 
 # ---------- 文字数制限に合わせた分割 ----------
@@ -1182,6 +1182,7 @@ def build_diagram(req: DiagramRequest, params: dict) -> tuple[str, str]:
     ends = {lo_b, hi_b}
     key_idx = {idx[k] for k in req.key_stations if k in idx} | {idx[k] for k in params["extra_key"]} | ends
     exp_idx = ({idx[k] for k in params["express_stops"]} | ends) if params["express_stops"] else key_idx
+    exp_idx -= {idx[k] for k in params["express_pass"]} - ends  # 速達だけが通過する駅
     skip_idx = {idx[k] for k in params["skip_stations"]} - ends
     short_idx = idx.get(params["short_turn_station"])
     if short_idx is not None and not (lo_b < short_idx < hi_b):
@@ -1395,9 +1396,7 @@ async def deliver(dest, summary: str, text: str):
 
 async def run_diagram_job(user_id: int, req: DiagramRequest):
     try:
-        info = (f"開始 {req.start_time} / 終了 {req.end_time} / 編成数 {req.trainsets}"
-                f" / 主要駅 {', '.join(req.key_stations) or 'なし'}")
-        params = await parse_remarks(req.remarks, [s.name for s in req.stations], info)
+        params = parse_remarks(req.remarks, [s.name for s in req.stations])  # ルールベースで読み取り（AI不使用）
         text, summary = await asyncio.to_thread(build_diagram, req, params)
         if req.target == "dm":
             dest = await bot.fetch_user(user_id)
@@ -1457,41 +1456,6 @@ async def api_submit(req: DiagramRequest, background: BackgroundTasks, t: str = 
         raise HTTPException(400, "出力先が不正です。")
     background.add_task(run_diagram_job, uid, req)  # 即応答・処理は裏で実行
     return {"ok": True, "message": "受け付けました。完了するとDiscordに届きます。"}
-
-
-# ---------- AI アシスタント（フォームの設定を Gemini が作る） ----------
-class AIMsg(BaseModel):
-    role: str
-    text: str = Field("", max_length=2000)
-
-
-class AIRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=1000)
-    history: list[AIMsg] = Field(default=[], max_length=10)
-    form: dict = {}
-
-
-@api.post("/api/ai")
-async def api_ai(req: AIRequest, t: str = ""):
-    verify_web_token(t)
-    if not GEMINI_API_KEY:
-        raise HTTPException(503, "GEMINI_API_KEY が未設定のため、AIは使えません。")
-    form_json = json.dumps(req.form, ensure_ascii=False)
-    if len(form_json) > 20000:
-        raise HTTPException(400, "フォームの内容が大きすぎます。")
-    cur_names = [str(x.get("name", "")).strip() for x in _lst(req.form.get("stations"))
-                 if isinstance(x, dict) and str(x.get("name", "")).strip()]
-    prompt = build_ai_prompt(req.message, req.history, form_json)
-    last = None
-    for _ in range(1):  # モデルの切り替えは gemini_generate 内で行う
-        try:
-            raw = await asyncio.wait_for(asyncio.to_thread(gemini_generate, prompt, AI_SYSTEM, True, 20, 50), timeout=60)
-            d = _load_json_obj(raw)
-            return {"reply": str(d.get("reply") or "")[:1500], "form": sanitize_ai_form(d.get("form"), cur_names)}
-        except Exception as e:
-            last = e
-            await asyncio.sleep(1)
-    raise HTTPException(502, f"AIの応答に失敗しました: {str(last)[:150] or type(last).__name__}")
 
 
 # Bot 起動時イベント
